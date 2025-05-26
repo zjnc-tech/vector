@@ -110,6 +110,9 @@ fn main() {
     // Always rerun if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
 
+    println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+    println!("cargo:rustc-link-lib=dylib=lldpctl");
+
     // re-run if the HEAD has changed. This is only necessary for non-release and nightly builds.
     #[cfg(not(feature = "nightly"))]
     println!("cargo:rerun-if-changed=.git/HEAD");
