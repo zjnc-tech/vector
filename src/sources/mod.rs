@@ -90,6 +90,8 @@ pub mod syslog;
 pub mod vector;
 #[cfg(feature = "sources-lldp")]
 pub mod lldp;
+#[cfg(feature = "sources-dcgm")]
+pub mod dcgm;
 
 pub mod util;
 

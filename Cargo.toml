@@ -407,6 +407,8 @@ mlua = { version = "0.10.3", default-features = false, features = ["lua54", "sen
 sysinfo = "0.34.2"
 byteorder = "1.5.0"
 time = "0.3.36"
+phf = { version = "0.11", features = ["macros"] }
+once_cell = "1.20.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7.0"
@@ -421,7 +423,9 @@ netlink-packet-core = "0.7.0"
 netlink-sys = { version = "0.8.7", features = ["tokio_socket"] }
 
 [build-dependencies]
-bindgen = "0.71.1"
+bindgen = "0.72.0"
+phf = "0.11"
+once_cell = "1.19"
 prost-build = { workspace = true, optional = true }
 tonic-build = { workspace = true, optional = true }
 # update 'openssl_version' in website/config.toml whenever <major.minor> version changes
@@ -609,6 +613,7 @@ sources-metrics = [
   "sources-statsd",
   "sources-vector",
   "sources-lldp",
+  "sources-dcgm"
 ]
 
 sources-amqp = ["lapin"]
@@ -639,6 +644,7 @@ sources-kafka = ["dep:rdkafka"]
 sources-kubernetes_logs = ["vector-lib/file-source", "kubernetes", "transforms-reduce"]
 sources-logstash = ["sources-utils-net-tcp", "tokio-util/net"]
 sources-lldp = []
+sources-dcgm = []
 sources-mongodb_metrics = ["dep:mongodb"]
 sources-nats = ["dep:async-nats", "dep:nkeys"]
 sources-nginx_metrics = ["dep:nom"]
