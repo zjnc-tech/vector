@@ -1,4 +1,5 @@
 use std::{collections::HashSet, env, fs::File, io::Write, path::Path, process::Command};
+use std::io::{BufRead, BufReader};
 
 struct TrackedEnv {
     tracked: HashSet<String>,
@@ -106,6 +107,72 @@ fn git_short_hash() -> std::io::Result<String> {
     })
 }
 
+fn generate_lldp_bindings() {
+    let lldp_bindings = bindgen::Builder::default()
+        .header("src/sources/lldp/wrapper.h")
+        .clang_arg("-I/usr/include/")
+        .layout_tests(false)
+        .generate()
+        .expect("Unable to generate lldpctl bindings");
+
+    lldp_bindings
+        .write_to_file("src/sources/lldp/bindings.rs")
+        .expect("Couldn't write lldpctl bindings!");
+}
+
+fn generate_dcgm_bindings() {
+    let bindings = bindgen::Builder::default()
+        .header("src/sources/dcgm/wrapper.h")
+        .clang_arg("-I/usr/include/")
+        .layout_tests(false)
+        .generate()
+        .expect("Unable to generate DCGM bindings");
+
+    bindings
+        .write_to_file("src/sources/dcgm/bindings.rs")
+        .expect("Couldn't write bindings!");
+}
+
+fn generate_dcgm_field_maps() {
+    let bindings_file = "src/sources/dcgm/bindings.rs";
+    let output_file = "src/sources/dcgm/dcgm_field_maps.rs";
+
+    let file = File::open(bindings_file).expect("Failed to open bindings.rs");
+    let reader = BufReader::new(file);
+
+    let mut entries = vec![];
+
+    for line in reader.lines().flatten() {
+        if let Some((name, _)) = line
+            .trim()
+            .strip_prefix("pub const ")
+            .and_then(|s| s.split_once(':'))
+        {
+            let name = name.trim();
+            if name.starts_with("DCGM_FI_") {
+                entries.push((name.to_string(), name.to_string()));
+            }
+        }
+    }
+
+    let mut out = File::create(&output_file).expect("Failed to create dcgm_field_maps.rs");
+
+    writeln!(out, "use crate::sources::dcgm::bindings::*;").unwrap();
+    writeln!(out, "use phf::phf_map;").unwrap();
+
+    writeln!(out, "pub static FIELD_NAME_TO_ID: phf::Map<&'static str, u16> = phf_map! {{").unwrap();
+    for (name, val) in &entries {
+        writeln!(out, "    \"{}\" => {} as u16,", name, val).unwrap();
+    }
+    writeln!(out, "}};\n").unwrap();
+
+    writeln!(out, "use once_cell::sync::Lazy;").unwrap();
+    writeln!(out, "use std::collections::HashMap;").unwrap();
+    writeln!(out, "pub static FIELD_ID_TO_NAME: Lazy<HashMap<u16, &'static str>> = Lazy::new(|| {{").unwrap();
+    writeln!(out, "    FIELD_NAME_TO_ID.entries().map(|(k, v)| (*v, *k)).collect()").unwrap();
+    writeln!(out, "}});").unwrap();
+}
+
 fn main() {
     // Always rerun if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
@@ -115,17 +182,14 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/sources/lldp/wrapper.h");
 
-    // 生成 lldpctl bindings
-    let lldp_bindings = bindgen::Builder::default()
-        .header("src/sources/lldp/wrapper.h") // 你要创建这个 wrapper.h
-        .clang_arg("-I/usr/include/")         // 可能需要根据实际 lldp 安装路径添加
-        .layout_tests(false)
-        .generate()
-        .expect("Unable to generate lldpctl bindings");
+    generate_lldp_bindings();
+    
+    println!("cargo:rustc-link-lib=dylib=dcgm");
 
-    lldp_bindings
-        .write_to_file("src/sources/lldp/bindings.rs")
-        .expect("Couldn't write lldpctl bindings!");
+    println!("cargo:rerun-if-changed=src/sources/dcgm/wrapper.h");
+
+    generate_dcgm_bindings();
+    generate_dcgm_field_maps();
 
     // re-run if the HEAD has changed. This is only necessary for non-release and nightly builds.
     #[cfg(not(feature = "nightly"))]

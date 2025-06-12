@@ -182,7 +182,7 @@ impl SinkConfig for ClickhouseConfig {
     }
 
     fn input(&self) -> Input {
-        Input::log()
+        Input::all()
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {

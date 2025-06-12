@@ -543,6 +543,7 @@ package-arm-unknown-linux-gnueabi-all: package-arm-unknown-linux-gnueabi package
 .PHONY: package-x86_64-unknown-linux-gnu
 package-x86_64-unknown-linux-gnu: target/artifacts/vector-${VERSION}-x86_64-unknown-linux-gnu.tar.gz ## Build an archive suitable for the `x86_64-unknown-linux-gnu` triple.
 	@echo "Output to ${<}."
+	@cp "${<}" target/artifacts/vector.tar.gz
 
 .PHONY: package-x86_64-unknown-linux-musl
 package-x86_64-unknown-linux-musl: target/artifacts/vector-${VERSION}-x86_64-unknown-linux-musl.tar.gz ## Build an archive suitable for the `x86_64-unknown-linux-musl` triple.
