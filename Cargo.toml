@@ -134,6 +134,8 @@ members = [
 ]
 
 [workspace.dependencies]
+walkdir = "2"
+thiserror = "2"
 anyhow = "1.0.97"
 cfg-if = { version = "1.0.0", default-features = false }
 chrono = { version = "0.4.40", default-features = false, features = ["clock", "serde"] }
@@ -188,6 +190,8 @@ semver.workspace = true
 snafu.workspace = true
 uuid.workspace = true
 vrl.workspace = true
+walkdir.workspace = true
+thiserror.workspace = true
 
 # Internal libs
 dnsmsg-parser = { path = "lib/dnsmsg-parser", optional = true }
@@ -613,7 +617,8 @@ sources-metrics = [
   "sources-statsd",
   "sources-vector",
   "sources-lldp",
-  "sources-dcgm"
+  "sources-dcgm",
+  "sources-pci"
 ]
 
 sources-amqp = ["lapin"]
@@ -645,6 +650,7 @@ sources-kubernetes_logs = ["vector-lib/file-source", "kubernetes", "transforms-r
 sources-logstash = ["sources-utils-net-tcp", "tokio-util/net"]
 sources-lldp = []
 sources-dcgm = []
+sources-pci = []
 sources-mongodb_metrics = ["dep:mongodb"]
 sources-nats = ["dep:async-nats", "dep:nkeys"]
 sources-nginx_metrics = ["dep:nom"]
