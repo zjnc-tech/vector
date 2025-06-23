@@ -1,8 +1,8 @@
+use crate::sources::lldp::bindings::*;
 use std::error::Error as StdError;
 use std::ffi::CStr;
 use std::fmt;
 use std::ptr;
-use crate::sources::lldp::bindings::*;
 
 /// LLDP consts
 pub const LLDPCTL_K_PORT_CHASSIS: lldpctl_key_t = 1208;
@@ -52,11 +52,11 @@ struct AtomGuard {
 }
 
 impl AtomGuard {
-    fn new(ptr: *mut lldpctl_atom_t) -> Self {
+    const fn new(ptr: *mut lldpctl_atom_t) -> Self {
         Self { ptr }
     }
 
-    fn ptr(&self) -> *mut lldpctl_atom_t {
+    const fn ptr(&self) -> *mut lldpctl_atom_t {
         self.ptr
     }
 }
@@ -105,8 +105,9 @@ impl LldpHandle {
 
                 let interface = AtomGuard::new(interface_atom);
 
-                let name = get_string_property(interface.ptr(), lldpctl_key_t_lldpctl_k_interface_name)
-                    .unwrap_or_default();
+                let name =
+                    get_string_property(interface.ptr(), lldpctl_key_t_lldpctl_k_interface_name)
+                        .unwrap_or_default();
 
                 let port_ptr = lldpctl_get_port(interface.ptr());
                 if port_ptr.is_null() {
@@ -121,12 +122,10 @@ impl LldpHandle {
 
                 let chassis = AtomGuard::new(chassis_ptr);
                 let device_name =
-                    get_string_property(chassis.ptr(), lldpctl_key_t_lldpctl_k_chassis_name).unwrap_or_default();
+                    get_string_property(chassis.ptr(), lldpctl_key_t_lldpctl_k_chassis_name)
+                        .unwrap_or_default();
 
-                result.push(LldpInterface {
-                    name,
-                    device_name,
-                });
+                result.push(LldpInterface { name, device_name });
             }
 
             Ok(result)
@@ -152,8 +151,9 @@ impl LldpHandle {
                 }
                 let interface = AtomGuard::new(interface_ptr);
 
-                let interface_name = get_string_property(interface.ptr(), lldpctl_key_t_lldpctl_k_interface_name)
-                    .unwrap_or_default();
+                let interface_name =
+                    get_string_property(interface.ptr(), lldpctl_key_t_lldpctl_k_interface_name)
+                        .unwrap_or_default();
 
                 let port_ptr = lldpctl_get_port(interface.ptr());
                 if port_ptr.is_null() {
@@ -168,10 +168,14 @@ impl LldpHandle {
 
                 let chassis = AtomGuard::new(chassis_ptr);
                 let local_chassis_name =
-                    get_string_property(chassis.ptr(), lldpctl_key_t_lldpctl_k_chassis_name).unwrap_or_default();
+                    get_string_property(chassis.ptr(), lldpctl_key_t_lldpctl_k_chassis_name)
+                        .unwrap_or_default();
 
                 // 获取 neighbor 列表
-                let neighbors_ptr = lldpctl_atom_get(port.ptr(), lldpctl_key_t_lldpctl_k_port_neighbors as lldpctl_key_t);
+                let neighbors_ptr = lldpctl_atom_get(
+                    port.ptr(),
+                    lldpctl_key_t_lldpctl_k_port_neighbors as lldpctl_key_t,
+                );
                 if neighbors_ptr.is_null() {
                     continue;
                 }
@@ -189,10 +193,12 @@ impl LldpHandle {
 
                     let neighbor = AtomGuard::new(neighbor_ptr);
 
-                    let remote_device = get_string_property(neighbor.ptr(), lldpctl_key_t_lldpctl_k_chassis_name)
-                        .unwrap_or_default();
+                    let remote_device =
+                        get_string_property(neighbor.ptr(), lldpctl_key_t_lldpctl_k_chassis_name)
+                            .unwrap_or_default();
                     let remote_port =
-                        get_string_property(neighbor.ptr(), lldpctl_key_t_lldpctl_k_port_id).unwrap_or_default();
+                        get_string_property(neighbor.ptr(), lldpctl_key_t_lldpctl_k_port_id)
+                            .unwrap_or_default();
 
                     result.push(LldpNeighbor {
                         local_interface: interface_name.clone(),

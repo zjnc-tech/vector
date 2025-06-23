@@ -8,9 +8,16 @@ use crate::{
 };
 use vector_lib::configurable::configurable_component;
 
-mod ffi;
-#[allow(improper_ctypes, unused_imports, non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
+#[allow(
+    improper_ctypes,
+    unused_imports,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code
+)]
 mod bindings;
+mod ffi;
 
 /// Configuration for the `lldp` source.
 #[configurable_component(source("lldp", "Collect lldp data."))]
@@ -26,13 +33,14 @@ pub struct LldpMetricsConfig {
     pub link_scrape_secs: u64,
 }
 
-fn default_interface_scrape_interval() -> u64 {
+const fn default_interface_scrape_interval() -> u64 {
     30
 }
 
-fn default_link_scrape_interval() -> u64 {
+const fn default_link_scrape_interval() -> u64 {
     60
 }
+
 #[derive(Clone)]
 pub struct Config {
     pub node_name: String,
@@ -67,8 +75,8 @@ impl SourceConfig for LldpMetricsConfig {
                         match ffi::get_lldp_interfaces_async().await {
                             Ok(interfaces) => {
                                 let interfaces_metrics = map_interfaces_to_metrics(interfaces, &config);
-                                if let Err(_) = interface_out.send_batch(interfaces_metrics).await {
-                                    return Err(());
+                                if interface_out.send_batch(interfaces_metrics).await.is_err() {
+                                    warn!("Failed to send LLDP interface batch");
                                 }
                             }
                             Err(e) => warn!("LLDP interface error: {}", e),
@@ -79,11 +87,11 @@ impl SourceConfig for LldpMetricsConfig {
                         match ffi::get_lldp_neighbors_async().await {
                             Ok(neighbors) => {
                                 let (interfaces, links) = map_neighbors_to_interface_and_link(neighbors, &config);
-                                if let Err(_) = link_out.send_batch(interfaces).await {
-                                    return Err(());
+                                if link_out.send_batch(interfaces).await.is_err() {
+                                    warn!("Failed to send LLDP interface batch");
                                 }
-                                if let Err(_) = link_out.send_batch(links).await {
-                                    return Err(());
+                                if link_out.send_batch(links).await.is_err() {
+                                    warn!("Failed to send LLDP link batch");
                                 }
                             }
                             Err(e) => warn!("LLDP link error: {}", e),
