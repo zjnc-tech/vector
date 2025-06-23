@@ -1,5 +1,5 @@
-use std::{collections::HashSet, env, fs::File, io::Write, path::Path, process::Command};
 use std::io::{BufRead, BufReader};
+use std::{collections::HashSet, env, fs::File, io::Write, path::Path, process::Command};
 
 struct TrackedEnv {
     tracked: HashSet<String>,
@@ -142,7 +142,7 @@ fn generate_dcgm_field_maps() {
 
     let mut entries = vec![];
 
-    for line in reader.lines().flatten() {
+    for line in reader.lines().map_while(Result::ok) {
         if let Some((name, _)) = line
             .trim()
             .strip_prefix("pub const ")
@@ -155,21 +155,36 @@ fn generate_dcgm_field_maps() {
         }
     }
 
-    let mut out = File::create(&output_file).expect("Failed to create dcgm_field_maps.rs");
+    let mut out = File::create(output_file).expect("Failed to create dcgm_field_maps.rs");
 
+    // Keep necessary imports
     writeln!(out, "use crate::sources::dcgm::bindings::*;").unwrap();
     writeln!(out, "use phf::phf_map;").unwrap();
 
-    writeln!(out, "pub static FIELD_NAME_TO_ID: phf::Map<&'static str, u16> = phf_map! {{").unwrap();
+    // Generate FIELD_NAME_TO_ID map
+    writeln!(
+        out,
+        "pub static FIELD_NAME_TO_ID: phf::Map<&'static str, u16> = phf_map! {{"
+    )
+    .unwrap();
     for (name, val) in &entries {
         writeln!(out, "    \"{}\" => {} as u16,", name, val).unwrap();
     }
     writeln!(out, "}};\n").unwrap();
 
-    writeln!(out, "use once_cell::sync::Lazy;").unwrap();
+    // Update to use std::sync::LazyLock
+    writeln!(out, "use std::sync::LazyLock;").unwrap();
     writeln!(out, "use std::collections::HashMap;").unwrap();
-    writeln!(out, "pub static FIELD_ID_TO_NAME: Lazy<HashMap<u16, &'static str>> = Lazy::new(|| {{").unwrap();
-    writeln!(out, "    FIELD_NAME_TO_ID.entries().map(|(k, v)| (*v, *k)).collect()").unwrap();
+    writeln!(
+        out,
+        "pub static FIELD_ID_TO_NAME: LazyLock<HashMap<u16, &'static str>> = LazyLock::new(|| {{"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    FIELD_NAME_TO_ID.entries().map(|(k, v)| (*v, *k)).collect()"
+    )
+    .unwrap();
     writeln!(out, "}});").unwrap();
 }
 
@@ -183,7 +198,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/sources/lldp/wrapper.h");
 
     generate_lldp_bindings();
-    
+
     println!("cargo:rustc-link-lib=dylib=dcgm");
 
     println!("cargo:rerun-if-changed=src/sources/dcgm/wrapper.h");

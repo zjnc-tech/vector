@@ -3,19 +3,22 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::time::Duration;
 
+use crate::sources::dcgm::bindings::*;
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
     event::metric::{Metric, MetricKind, MetricTags, MetricValue},
 };
 use vector_lib::configurable::configurable_component;
-use crate::sources::dcgm::bindings::*;
 
 #[allow(
     unused_imports,
     non_camel_case_types,
     non_snake_case,
     non_upper_case_globals,
-    dead_code
+    dead_code,
+    clippy::all,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::missing_const_for_fn
 )]
 mod bindings;
 mod collector;
@@ -67,7 +70,7 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
                 let mut field_ids = field_groups.get(&group_name).unwrap().clone();
                 let mut out = out.clone();
                 let shutdown = shutdown.clone();
-                let handle = handle.clone();
+                // let handle = handle.clone();
 
                 let join = tokio::spawn(async move {
                     let interval =
@@ -112,7 +115,6 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
                 join_handles.push(join);
             }
 
-            // 等待所有任务结束
             for handle in join_handles {
                 let _ = handle.await;
             }
@@ -130,10 +132,7 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
     }
 }
 
-pub fn map_metrics(
-    group_name: String,
-    data: Vec<(u32, Vec<dcgmFieldValue_v1>)>,
-) -> Vec<Metric> {
+pub fn map_metrics(group_name: String, data: Vec<(u32, Vec<dcgmFieldValue_v1>)>) -> Vec<Metric> {
     let now = Utc::now();
     let mut metrics = Vec::new();
 
@@ -158,12 +157,12 @@ pub fn map_metrics(
                                 MetricKind::Absolute,
                                 MetricValue::Gauge { value: 1.0 },
                             )
-                                .with_timestamp(Some(now))
-                                .with_tags(Some(tags)),
+                            .with_timestamp(Some(now))
+                            .with_tags(Some(tags)),
                         );
                     }
                     Err(_) => {
-                        eprintln!("Invalid UTF-8 string for field {}", fid);
+                        warn!("Invalid UTF-8 string for field {}", fid);
                     }
                 }
                 continue;
@@ -180,21 +179,17 @@ pub fn map_metrics(
                     }
                 }
                 val if val == DCGM_FT_BINARY as u16 => {
-                    eprintln!("Binary type unsupported for field {}", fid);
+                    warn!("Binary type unsupported for field {}", fid);
                     continue;
                 }
                 _ => {
-                    eprintln!("Unknown field type {} for field {}", field_type, fid);
+                    warn!("Unknown field type {} for field {}", field_type, fid);
                     continue;
                 }
             };
 
             metrics.push(
-                Metric::new(
-                    metric_name.to_string(),
-                    MetricKind::Absolute,
-                    metric_value,
-                )
+                Metric::new(metric_name.to_string(), MetricKind::Absolute, metric_value)
                     .with_timestamp(Some(now))
                     .with_tags(Some(tags)),
             );

@@ -984,7 +984,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     pub fn getloadavg(__loadavg: *mut f64, __nelem: ::std::os::raw::c_int)
-    -> ::std::os::raw::c_int;
+        -> ::std::os::raw::c_int;
 }
 pub type int_least8_t = __int_least8_t;
 pub type int_least16_t = __int_least16_t;

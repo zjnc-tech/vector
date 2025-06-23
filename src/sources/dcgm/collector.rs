@@ -47,7 +47,7 @@ pub fn register_fields(
         )
     };
     if ret != dcgmReturn_enum_DCGM_ST_OK {
-        eprintln!("dcgmGroupCreate failed: {}", ret);
+        warn!("dcgmGroupCreate failed: {}", ret);
         return Err(ret);
     }
 
@@ -62,7 +62,7 @@ pub fn register_fields(
         )
     };
     if ret != dcgmReturn_enum_DCGM_ST_OK {
-        eprintln!("dcgmFieldGroupCreate failed: {}", ret);
+        warn!("dcgmFieldGroupCreate failed: {}", ret);
         return Err(ret);
     }
 
@@ -79,7 +79,7 @@ pub fn register_fields(
     };
 
     if watch_ret != dcgmReturn_enum_DCGM_ST_OK {
-        eprintln!("dcgmWatchFields failed: {}", watch_ret);
+        warn!("dcgmWatchFields failed: {}", watch_ret);
         return Err(watch_ret);
     }
 
@@ -105,7 +105,7 @@ pub fn collect_metrics_by_fields(
 ) -> Result<Vec<(u32, Vec<dcgmFieldValue_v1>)>, i32> {
     let update_ret = unsafe { dcgmUpdateAllFields(handle, 1) };
     if update_ret != 0 {
-        eprintln!("Failed to update all fields: {}", update_ret);
+        warn!("Failed to update all fields: {}", update_ret);
         return Err(update_ret);
     }
 
@@ -129,7 +129,7 @@ pub fn collect_metrics_by_fields(
             };
 
             if ret != 0 || field_value.status != 0 {
-                eprintln!(
+                warn!(
                     "Failed to collect field {} for GPU {}: dcgm_ret = {}, field_status = {}",
                     fid, gpu_id, ret, field_value.status
                 );

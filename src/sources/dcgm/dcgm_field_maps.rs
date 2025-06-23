@@ -431,8 +431,7 @@ pub static FIELD_NAME_TO_ID: phf::Map<&'static str, u16> = phf_map! {
     "DCGM_FI_MAX_FIELDS" => DCGM_FI_MAX_FIELDS as u16,
 };
 
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
-pub static FIELD_ID_TO_NAME: Lazy<HashMap<u16, &'static str>> = Lazy::new(|| {
-    FIELD_NAME_TO_ID.entries().map(|(k, v)| (*v, *k)).collect()
-});
+use std::sync::LazyLock;
+pub static FIELD_ID_TO_NAME: LazyLock<HashMap<u16, &'static str>> =
+    LazyLock::new(|| FIELD_NAME_TO_ID.entries().map(|(k, v)| (*v, *k)).collect());
