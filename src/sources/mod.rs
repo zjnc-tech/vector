@@ -15,6 +15,8 @@ pub mod aws_s3;
 pub mod aws_sqs;
 #[cfg(feature = "sources-datadog_agent")]
 pub mod datadog_agent;
+#[cfg(feature = "sources-dcgm")]
+pub mod dcgm;
 #[cfg(feature = "sources-demo_logs")]
 pub mod demo_logs;
 #[cfg(feature = "sources-dnstap")]
@@ -54,6 +56,8 @@ pub mod journald;
 pub mod kafka;
 #[cfg(feature = "sources-kubernetes_logs")]
 pub mod kubernetes_logs;
+#[cfg(feature = "sources-lldp")]
+pub mod lldp;
 #[cfg(feature = "sources-logstash")]
 pub mod logstash;
 #[cfg(feature = "sources-mongodb_metrics")]
@@ -64,6 +68,8 @@ pub mod nats;
 pub mod nginx_metrics;
 #[cfg(feature = "sources-opentelemetry")]
 pub mod opentelemetry;
+#[cfg(feature = "sources-pci")]
+pub mod pci;
 #[cfg(feature = "sources-postgresql_metrics")]
 pub mod postgresql_metrics;
 #[cfg(any(
@@ -88,10 +94,6 @@ pub mod statsd;
 pub mod syslog;
 #[cfg(feature = "sources-vector")]
 pub mod vector;
-#[cfg(feature = "sources-lldp")]
-pub mod lldp;
-#[cfg(feature = "sources-dcgm")]
-pub mod dcgm;
 
 pub mod util;
 

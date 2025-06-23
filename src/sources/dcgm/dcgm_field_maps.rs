@@ -1,5 +1,4 @@
 use crate::sources::dcgm::bindings::*;
-
 use phf::phf_map;
 pub static FIELD_NAME_TO_ID: phf::Map<&'static str, u16> = phf_map! {
     "DCGM_FI_UNKNOWN" => DCGM_FI_UNKNOWN as u16,
@@ -431,6 +430,7 @@ pub static FIELD_NAME_TO_ID: phf::Map<&'static str, u16> = phf_map! {
     "DCGM_FI_DEV_CPU_MODEL" => DCGM_FI_DEV_CPU_MODEL as u16,
     "DCGM_FI_MAX_FIELDS" => DCGM_FI_MAX_FIELDS as u16,
 };
+
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 pub static FIELD_ID_TO_NAME: Lazy<HashMap<u16, &'static str>> = Lazy::new(|| {
