@@ -14,7 +14,10 @@ use vector_lib::configurable::configurable_component;
     non_camel_case_types,
     non_snake_case,
     non_upper_case_globals,
-    dead_code
+    dead_code,
+    clippy::all,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::missing_const_for_fn
 )]
 mod bindings;
 mod ffi;
