@@ -137,38 +137,41 @@ pub fn map_metrics(group_name: String, data: Vec<(u32, Vec<dcgmFieldValue_v1>)>)
     let mut metrics = Vec::new();
 
     for (gpu_id, field_values) in data {
-        for field_value in field_values {
+        // Step 1: 收集所有 string 类型字段作为 tag
+        let mut common_tags = MetricTags::default();
+        common_tags.insert("gpu_id".into(), gpu_id.to_string());
+        common_tags.insert("group".into(), group_name.clone());
+
+        for field_value in &field_values {
             let fid = field_value.fieldId;
             let field_type = field_value.fieldType;
-            let metric_name = resolve_field_id_to_name(fid).unwrap_or("unknown_metric");
-
-            let mut tags = MetricTags::default();
-            tags.insert("gpu_id".into(), gpu_id.to_string());
-            tags.insert("group".into(), group_name.clone());
 
             if field_type == DCGM_FT_STRING as u16 {
+                let metric_name = resolve_field_id_to_name(fid).unwrap_or("unknown_field");
                 let cstr = unsafe { CStr::from_ptr(field_value.value.str_.as_ptr()) };
                 match cstr.to_str() {
                     Ok(s) => {
-                        tags.insert(metric_name.to_string(), s.to_string());
-                        metrics.push(
-                            Metric::new(
-                                metric_name.to_string(),
-                                MetricKind::Absolute,
-                                MetricValue::Gauge { value: 1.0 },
-                            )
-                            .with_timestamp(Some(now))
-                            .with_tags(Some(tags)),
-                        );
+                        common_tags.insert(metric_name.to_string(), s.to_string());
                     }
                     Err(_) => {
                         warn!("Invalid UTF-8 string for field {}", fid);
                     }
                 }
+            }
+        }
+
+        // Step 2: 生成数值型 Metric
+        for field_value in field_values {
+            let fid = field_value.fieldId;
+            let field_type = field_value.fieldType;
+
+            // 跳过 string 类型字段（已作为 tag 处理）
+            if field_type == DCGM_FT_STRING as u16 {
                 continue;
             }
 
-            // 构造数值类 MetricValue
+            let metric_name = resolve_field_id_to_name(fid).unwrap_or("unknown_metric");
+
             let metric_value = match field_type {
                 val if val == DCGM_FT_DOUBLE as u16 => MetricValue::Gauge {
                     value: unsafe { field_value.value.dbl },
@@ -191,7 +194,7 @@ pub fn map_metrics(group_name: String, data: Vec<(u32, Vec<dcgmFieldValue_v1>)>)
             metrics.push(
                 Metric::new(metric_name.to_string(), MetricKind::Absolute, metric_value)
                     .with_timestamp(Some(now))
-                    .with_tags(Some(tags)),
+                    .with_tags(Some(common_tags.clone())),
             );
         }
     }
