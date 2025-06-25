@@ -25,11 +25,12 @@ mod collector;
 mod dcgm_field_maps;
 
 #[allow(warnings, clippy::pedantic, clippy::nursery)]
-pub(crate) mod v1 {
-    include!(concat!(env!("OUT_DIR"), "/v1.rs"));
+pub(crate) mod v1alpha1 {
+    include!(concat!(env!("OUT_DIR"), "/v1alpha1.rs"));
 }
 
 pub mod pod_resource_mapper;
+mod proto_gen;
 
 /// Configuration of one group of the `dcgm`.
 #[configurable_component(source("dcgm", "dcgm group data."))]
@@ -63,7 +64,18 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
         let out = cx.out.clone();
         let groups = self.groups.clone();
 
-        let field_groups = resolve_all_fields(&self.groups)?.clone();
+        let mut field_groups = resolve_all_fields(&self.groups)?.clone();
+
+        // 为每个字段组添加DCGM_FI_DEV_UUID
+        for fields in field_groups.values_mut() {
+            // 添加DCGM_FI_DEV_UUID，避免重复添加
+            if !fields.contains(&(DCGM_FI_DEV_UUID as u16)) {
+                fields.push(DCGM_FI_DEV_UUID as u16);
+            }
+            if !fields.contains(&(DCGM_FI_DEV_NAME as u16)) {
+                fields.push(DCGM_FI_DEV_NAME as u16);
+            }
+        }
 
         Ok(Box::pin(async move {
             let handle = collector::init_dcgm().map_err(|e| {
@@ -156,67 +168,102 @@ pub fn map_metrics(
         common_tags.insert("gpu_id".into(), gpu_id.to_string());
         common_tags.insert("group".into(), group_name.clone());
 
-        if let Some(pod_info) = pod_mapper.get(gpu_id) {
-            common_tags.insert("namespace".into(), pod_info.namespace);
-            common_tags.insert("pod".into(), pod_info.pod);
-            common_tags.insert("container".into(), pod_info.container);
-        }
+        let mut gpu_uuid: Option<String> = None;
 
-        for field_value in &field_values {
-            let fid = field_value.fieldId;
-            let field_type = field_value.fieldType;
-
-            if field_type == DCGM_FT_STRING as u16 {
-                let metric_name = resolve_field_id_to_name(fid).unwrap_or("unknown_field");
-                let cstr = unsafe { CStr::from_ptr(field_value.value.str_.as_ptr()) };
-                match cstr.to_str() {
-                    Ok(s) => {
-                        common_tags.insert(metric_name.to_string(), s.to_string());
-                    }
+        // 提取 UUID、model_name 和字符串字段
+        for field in &field_values {
+            if let FieldType::String = FieldType::from(field.fieldType) {
+                let fid = field.fieldId;
+                let cstr = unsafe { CStr::from_ptr(field.value.str_.as_ptr()) };
+                let str_val = match cstr.to_str() {
+                    Ok(v) => v,
                     Err(_) => {
-                        warn!("Invalid UTF-8 string for field {}", fid);
+                        warn!("Invalid UTF-8 for field {} on GPU {}", fid, gpu_id);
+                        continue;
+                    }
+                };
+
+                match fid {
+                    id if id == DCGM_FI_DEV_UUID as u16 => {
+                        gpu_uuid = Some(str_val.to_string());
+                        common_tags.insert("UUID".to_string(), str_val.to_string());
+                    }
+                    id if id == DCGM_FI_DEV_NAME as u16 => {
+                        common_tags.insert("model_name".to_string(), str_val.to_string());
+                    }
+                    _ => {
+                        let key = resolve_field_id_to_name(fid).unwrap_or("unknown_field");
+                        common_tags.insert(key.to_string(), str_val.to_string());
                     }
                 }
             }
         }
 
-        for field_value in field_values {
-            let fid = field_value.fieldId;
-            let field_type = field_value.fieldType;
-
-            if field_type == DCGM_FT_STRING as u16 {
-                continue;
+        // 通过 UUID 查询 Pod 信息
+        if let Some(uuid) = gpu_uuid.as_ref() {
+            if let Some(pod_info) = pod_mapper.get(uuid) {
+                common_tags.insert("namespace".into(), pod_info.namespace.clone());
+                common_tags.insert("pod".into(), pod_info.pod.clone());
+                common_tags.insert("container".into(), pod_info.container.clone());
             }
+        }
 
+        // 处理数值字段
+        for field in &field_values {
+            let fid = field.fieldId;
             let metric_name = resolve_field_id_to_name(fid).unwrap_or("unknown_metric");
-            let metric_value = match field_type {
-                val if val == DCGM_FT_DOUBLE as u16 => MetricValue::Gauge {
-                    value: unsafe { field_value.value.dbl },
-                },
-                val if val == DCGM_FT_INT64 as u16 || val == DCGM_FT_TIMESTAMP as u16 => {
-                    MetricValue::Gauge {
-                        value: unsafe { field_value.value.i64_ as f64 },
-                    }
+
+            let value = match FieldType::from(field.fieldType) {
+                FieldType::Double => Some(unsafe { field.value.dbl }),
+                FieldType::Int64 | FieldType::Timestamp => Some(unsafe { field.value.i64_ as f64 }),
+                FieldType::Binary => {
+                    warn!("Binary field {} not supported", fid);
+                    None
                 }
-                val if val == DCGM_FT_BINARY as u16 => {
-                    warn!("Binary type unsupported for field {}", fid);
-                    continue;
-                }
-                _ => {
-                    warn!("Unknown field type {} for field {}", field_type, fid);
-                    continue;
+                FieldType::String => None,
+                FieldType::Unknown(t) => {
+                    warn!("Unknown field type {} for field {}", t, fid);
+                    None
                 }
             };
 
-            metrics.push(
-                Metric::new(metric_name.to_string(), MetricKind::Absolute, metric_value)
+            if let Some(val) = value {
+                metrics.push(
+                    Metric::new(
+                        metric_name.to_string(),
+                        MetricKind::Absolute,
+                        MetricValue::Gauge { value: val },
+                    )
                     .with_timestamp(Some(now))
                     .with_tags(Some(common_tags.clone())),
-            );
+                );
+            }
         }
     }
 
     metrics
+}
+
+enum FieldType {
+    String,
+    Double,
+    Int64,
+    Timestamp,
+    Binary,
+    Unknown(u16),
+}
+
+impl From<u16> for FieldType {
+    fn from(v: u16) -> Self {
+        match v {
+            x if x == DCGM_FT_STRING as u16 => FieldType::String,
+            x if x == DCGM_FT_DOUBLE as u16 => FieldType::Double,
+            x if x == DCGM_FT_INT64 as u16 => FieldType::Int64,
+            x if x == DCGM_FT_TIMESTAMP as u16 => FieldType::Timestamp,
+            x if x == DCGM_FT_BINARY as u16 => FieldType::Binary,
+            other => FieldType::Unknown(other),
+        }
+    }
 }
 
 fn resolve_all_fields(

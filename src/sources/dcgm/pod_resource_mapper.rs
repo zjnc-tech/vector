@@ -7,8 +7,8 @@ use tokio::time;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-use crate::sources::dcgm::v1::{ListPodResourcesRequest};
-use crate::sources::dcgm::v1::pod_resources_lister_client::PodResourcesListerClient;
+use crate::sources::dcgm::v1alpha1::pod_resources_lister_client::PodResourcesListerClient;
+use crate::sources::dcgm::v1alpha1::ListPodResourcesRequest;
 
 #[derive(Debug, Clone, Default)]
 pub struct PodInfo {
@@ -19,7 +19,7 @@ pub struct PodInfo {
 
 #[derive(Debug, Clone)]
 pub struct PodResourcesMapper {
-    inner: Arc<RwLock<HashMap<u32, PodInfo>>>,
+    inner: Arc<RwLock<HashMap<String, PodInfo>>>,
 }
 
 impl Default for PodResourcesMapper {
@@ -35,14 +35,16 @@ impl PodResourcesMapper {
         Self::default()
     }
 
-    pub fn update(&self, data: &HashMap<u32, PodInfo>) {
+    /// 更新 GPU UUID -> PodInfo 映射
+    pub fn update(&self, data: &HashMap<String, PodInfo>) {
         let mut writer = self.inner.write().unwrap();
-        *writer = data.clone();
+        *writer = data.clone(); // 如果数据量大，也可以用 `.clear()` + `.extend()` 避免重新分配
     }
 
-    pub fn get(&self, gpu_id: u32) -> Option<PodInfo> {
+    /// 通过 GPU UUID 查询 PodInfo
+    pub fn get(&self, gpu_id: &str) -> Option<PodInfo> {
         let reader = self.inner.read().unwrap();
-        reader.get(&gpu_id).cloned()
+        reader.get(gpu_id).cloned()
     }
 }
 
@@ -52,7 +54,7 @@ pub struct PodResourcesRefresher {
 }
 
 impl PodResourcesRefresher {
-    pub fn new(mapper: PodResourcesMapper) -> Self {
+    pub const fn new(mapper: PodResourcesMapper) -> Self {
         Self { mapper }
     }
 
@@ -65,47 +67,42 @@ impl PodResourcesRefresher {
         }
 
         let mapper = self.mapper;
-
         loop {
             match Self::connect_to_kubelet(uds_path).await {
                 Ok(mut client) => match client.list(ListPodResourcesRequest {}).await {
                     Ok(resp) => {
                         let mut map = HashMap::new();
                         for pod in resp.into_inner().pod_resources {
-                            let pod_name = pod.name;
-                            let namespace = pod.namespace;
-
+                            let pod_name = pod.name.clone();
+                            let namespace = pod.namespace.clone();
                             for container in pod.containers {
-                                let container_name = container.name;
+                                let container_name = container.name.clone();
                                 for device in container.devices {
                                     if device.resource_name != "nvidia.com/gpu" {
                                         continue;
                                     }
 
                                     for id in device.device_ids {
-                                        if let Ok(id_num) = id.parse::<u32>() {
-                                            map.insert(
-                                                id_num,
-                                                PodInfo {
-                                                    pod: pod_name.clone(),
-                                                    namespace: namespace.clone(),
-                                                    container: container_name.clone(),
-                                                },
-                                            );
-                                        }
+                                        map.insert(
+                                            id.clone(),
+                                            PodInfo {
+                                                pod: pod_name.clone(),
+                                                namespace: namespace.clone(),
+                                                container: container_name.clone(),
+                                            },
+                                        );
                                     }
                                 }
                             }
                         }
-
                         mapper.update(&map);
                     }
                     Err(e) => {
-                        warn!("Failed to list pod resources: {}", e);
+                        warn!("Failed to list pod resources: {:?}", e);
                     }
                 },
                 Err(e) => {
-                    warn!("Failed to connect to pod resources: {}", e);
+                    warn!("Failed to connect to pod resources: {:?}", e);
                 }
             }
 
