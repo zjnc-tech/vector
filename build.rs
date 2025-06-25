@@ -218,6 +218,7 @@ fn main() {
         println!("cargo:rerun-if-changed=proto/vector/dd_trace.proto");
         println!("cargo:rerun-if-changed=proto/vector/ddsketch_full.proto");
         println!("cargo:rerun-if-changed=proto/vector/vector.proto");
+        println!("cargo:rerun-if-changed=proto/k8s/pod_resources.proto");
 
         // Create and store the "file descriptor set" from the compiled Protocol Buffers packages.
         //
@@ -245,10 +246,12 @@ fn main() {
                     "proto/third-party/google/pubsub/v1/pubsub.proto",
                     "proto/third-party/google/rpc/status.proto",
                     "proto/vector/vector.proto",
+                    "proto/k8s/pod_resources.proto",
                 ],
                 &[
                     "proto/third-party",
                     "proto/vector",
+                    "proto/k8s",
                     "lib/vector-core/proto/",
                 ],
             )
