@@ -1,7 +1,6 @@
 mod errors;
 #[allow(dead_code)]
-mod pci;
-use chrono::Utc;
+mod device;
 use serde_with::serde_as;
 use std::time::Duration;
 use vector_lib::{config::DataType, schema};
@@ -44,67 +43,67 @@ pub struct Config {
 
 impl_generate_config_from_default!(Config);
 
-impl Into<LogEvent> for pci::PciDevice {
-    fn into(self) -> LogEvent {
+impl From<device::PciDevice> for LogEvent {
+    fn from(val: device::PciDevice) -> Self {
         let namespace = LogNamespace::Legacy;
         let mut log = LogEvent::default();
-        let now = Utc::now();
+        let now = chrono::Utc::now();
         namespace.insert_standard_vector_source_metadata(&mut log, Config::NAME, now);
         namespace.insert_source_metadata(
             Config::NAME,
             &mut log,
             Some(LegacyKey::InsertIfEmpty(path!("address"))),
             path!("address"),
-            self.address.to_string(),
+            val.address.to_string(),
         );
         namespace.insert_source_metadata(
             Config::NAME,
             &mut log,
             Some(LegacyKey::InsertIfEmpty(path!("class"))),
             path!("class"),
-            format!("{:#x}", self.class),
+            format!("{:#x}", val.class),
         );
         namespace.insert_source_metadata(
             Config::NAME,
             &mut log,
             Some(LegacyKey::InsertIfEmpty(path!("device"))),
             path!("device"),
-            format!("{:#x}", self.device),
+            format!("{:#x}", val.device),
         );
         namespace.insert_source_metadata(
             Config::NAME,
             &mut log,
             Some(LegacyKey::InsertIfEmpty(path!("vendor"))),
             path!("vendor"),
-            format!("{:#x}", self.vendor),
+            format!("{:#x}", val.vendor),
         );
         namespace.insert_source_metadata(
             Config::NAME,
             &mut log,
             Some(LegacyKey::InsertIfEmpty(path!("max_link_speed"))),
             path!("max_link_speed"),
-            self.max_link_speed.unwrap_or("".to_string()),
+            val.max_link_speed.unwrap_or("".to_string()),
         );
         namespace.insert_source_metadata(
             Config::NAME,
             &mut log,
             Some(LegacyKey::InsertIfEmpty(path!("max_link_width"))),
             path!("max_link_width"),
-            self.max_link_width.unwrap_or("".to_string()),
+            val.max_link_width.unwrap_or("".to_string()),
         );
         namespace.insert_source_metadata(
             Config::NAME,
             &mut log,
             Some(LegacyKey::InsertIfEmpty(path!("current_link_speed"))),
             path!("current_link_speed"),
-            self.current_link_speed.unwrap_or("".to_string()),
+            val.current_link_speed.unwrap_or("".to_string()),
         );
         namespace.insert_source_metadata(
             Config::NAME,
             &mut log,
             Some(LegacyKey::InsertIfEmpty(path!("current_link_width"))),
             path!("current_link_width"),
-            self.current_link_width.unwrap_or("".to_string()),
+            val.current_link_width.unwrap_or("".to_string()),
         );
         log
     }
@@ -145,7 +144,7 @@ impl Config {
         self.read_pci_file(pci_addr, "current_link_width")
     }
 
-    fn walk_pcie_addrs(&self) -> crate::Result<Vec<pci::PciDevice>> {
+    fn walk_pcie_addrs(&self) -> crate::Result<Vec<device::PciDevice>> {
         let mut pcis = Vec::new();
         for entry in WalkDir::new(SYS_PCI_PATH)
             .min_depth(1)
@@ -167,7 +166,7 @@ impl Config {
             if actual_metadata.is_dir() {
                 if let Some(dir_name) = actual_path.file_name().and_then(|n| n.to_str()) {
                     if dir_name.contains(":") {
-                        let addr = pci::PciAddress::from_str(dir_name)?;
+                        let addr = device::PciAddress::from_str(dir_name)?;
                         let class = u32::from_str_radix(
                             self.read_pci_class(&actual_path)?
                                 .as_str()
@@ -193,7 +192,7 @@ impl Config {
                         let pci_max_link_speed = self.read_pci_max_link_speed(&actual_path).ok();
                         let pci_max_link_width = self.read_pci_max_link_width(&actual_path).ok();
                         pcis.push(
-                            pci::PciDevice::new(addr, vendor, device, class)
+                            device::PciDevice::new(addr, vendor, device, class)
                                 .set_current_link_speed(pci_current_link_speed)
                                 .set_current_link_width(pci_current_link_width)
                                 .set_max_link_speed(pci_max_link_speed)

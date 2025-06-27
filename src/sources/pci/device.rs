@@ -13,7 +13,7 @@ pub(super) struct PciDevice {
 }
 
 impl PciDevice {
-    pub(super) fn new(address: PciAddress, vendor: u32, device: u32, class: u32) -> Self {
+    pub(super) const fn new(address: PciAddress, vendor: u32, device: u32, class: u32) -> Self {
         Self {
             address,
             vendor,
@@ -105,10 +105,13 @@ impl PciAddress {
             _ => Err(Box::new(PciError::IllegalPciAddress(address.to_string()))),
         }
     }
+}
 
-    pub(super) fn to_string(&self) -> String {
-        format!(
-            "{:04x}:{:02x}:{:02x}.{:01x}",
+impl std::fmt::Display for PciAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:04x}:{:02x}:{:02x}.{:x}",
             self.domain, self.bus, self.device, self.function
         )
     }
