@@ -34,6 +34,8 @@ pub mod azure_monitor_logs;
 pub mod blackhole;
 #[cfg(feature = "sinks-clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "sinks-clickhouse_metrics")]
+pub mod clickhouse_metrics;
 #[cfg(feature = "sinks-console")]
 pub mod console;
 #[cfg(feature = "sinks-databend")]
