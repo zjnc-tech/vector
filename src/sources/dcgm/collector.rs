@@ -29,12 +29,14 @@ pub fn register_fields(
     field_ids: &mut [u16],
     group_name: &str,
     field_group_name: &str,
-    update_freq_usec: u64,
+    update_freq_sec: u64,
 ) -> Result<(dcgmGpuGrp_t, dcgmFieldGrp_t), i32> {
     let mut field_group_id: dcgmFieldGrp_t = 0;
 
     let group_name_cstr = CString::new(group_name).unwrap();
     let field_group_cstr = CString::new(field_group_name).unwrap();
+
+    let update_freq_usec = (update_freq_sec * 1_000_000) as u64;
 
     // 创建默认 GPU 分组
     let mut group_id: dcgmGpuGrp_t = 0;
@@ -128,15 +130,29 @@ pub fn collect_metrics_by_fields(
                 )
             };
 
-            if ret != 0 || field_value.status != 0 {
-                warn!(
-                    "Failed to collect field {} for GPU {}: dcgm_ret = {}, field_status = {}",
-                    fid, gpu_id, ret, field_value.status
-                );
-                continue;
-            }
+            match (ret, field_value.status) {
+                (0, status) => {
+                    if status == dcgmReturn_enum_DCGM_ST_NO_DATA as i32 {
+                        warn!(
+                            "No data for field {} on GPU {}, status: {}",
+                            fid, gpu_id, status
+                        );
+                    } else if status != dcgmReturn_enum_DCGM_ST_OK as i32 {
+                        warn!(
+                            "Field {} on GPU {} has non-OK status: {}",
+                            fid, gpu_id, status
+                        );
+                    }
 
-            group_result.push(field_value);
+                    group_result.push(field_value);
+                }
+                (err, status) => {
+                    warn!(
+                        "Failed to collect field {} for GPU {}: dcgm_ret = {}, field_status = {}",
+                        fid, gpu_id, err, status
+                    );
+                }
+            }
         }
 
         if !group_result.is_empty() {

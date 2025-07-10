@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package v1alpha1;
+
+option go_package = "k8s.io/kubelet/pkg/apis/podresources/v1alpha1";
+
+import "pod_resources_types.proto";
+
+service PodResourcesLister {
+    rpc List(ListPodResourcesRequest) returns (ListPodResourcesResponse);
+}

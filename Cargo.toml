@@ -200,6 +200,7 @@ dnsmsg-parser = { path = "lib/dnsmsg-parser", optional = true }
 dnstap-parser = { path = "lib/dnstap-parser", optional = true }
 fakedata = { path = "lib/fakedata", optional = true }
 portpicker = { path = "lib/portpicker" }
+protobuf = "3"
 tracing-limit = { path = "lib/tracing-limit" }
 vector-common = { path = "lib/vector-common", default-features = false}
 vector-lib.workspace = true
@@ -430,6 +431,7 @@ netlink-sys = { version = "0.8.7", features = ["tokio_socket"] }
 [build-dependencies]
 bindgen = "0.72.0"
 phf = "0.11"
+protobuf-codegen = "3"
 prost-build = { workspace = true, optional = true }
 tonic-build = { workspace = true, optional = true }
 # update 'openssl_version' in website/config.toml whenever <major.minor> version changes
@@ -649,7 +651,7 @@ sources-kafka = ["dep:rdkafka"]
 sources-kubernetes_logs = ["vector-lib/file-source", "kubernetes", "transforms-reduce"]
 sources-logstash = ["sources-utils-net-tcp", "tokio-util/net"]
 sources-lldp = []
-sources-dcgm = []
+sources-dcgm = ["dep:prost", "dep:tonic", "protobuf-build"]
 sources-pci = []
 sources-mongodb_metrics = ["dep:mongodb"]
 sources-nats = ["dep:async-nats", "dep:nkeys"]
