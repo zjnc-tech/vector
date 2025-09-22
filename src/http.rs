@@ -295,6 +295,8 @@ pub enum Auth {
     Bearer {
         /// The bearer authentication token.
         token: SensitiveString,
+        /// The file path of bearer authentication token.
+        token_file: String,
     },
 }
 
@@ -330,10 +332,25 @@ impl Auth {
                 let auth = Authorization::basic(user.as_str(), password.inner());
                 map.typed_insert(auth);
             }
-            Auth::Bearer { token } => match Authorization::bearer(token.inner()) {
-                Ok(auth) => map.typed_insert(auth),
-                Err(error) => error!(message = "Invalid bearer token.", token = %token, %error),
-            },
+            Auth::Bearer { token , token_file } => {
+                if token_file != ""{
+                    match std::fs::read_to_string(token_file) {
+                        Ok(contents) => {
+                            let token = contents.trim();
+                            match Authorization::bearer(token) {
+                                Ok(auth) => map.typed_insert(auth),
+                                Err(error) => error!(message = "Invalid bearer token.", token = %token, %error),
+                            }
+                        }
+                        Err(error) => error!(message = "Invalid bearer token from file.", file = %token_file, %error),
+                    }
+                }else {
+                    match Authorization::bearer(token.inner()) {
+                        Ok(auth) => map.typed_insert(auth),
+                        Err(error) => error!(message = "Invalid bearer token.", token = %token, %error),
+                    }
+                }
+            }
         }
     }
 }

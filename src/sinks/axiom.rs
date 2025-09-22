@@ -116,6 +116,7 @@ impl SinkConfig for AxiomConfig {
             compression: self.compression,
             auth: Some(HttpAuthConfig::Bearer {
                 token: self.token.clone(),
+                token_file: "".to_string(),
             }),
             method: HttpMethod::Post,
             tls: self.tls.clone(),

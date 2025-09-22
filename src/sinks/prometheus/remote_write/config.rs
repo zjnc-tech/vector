@@ -152,6 +152,7 @@ impl SinkConfig for RemoteWriteConfig {
             Some(PrometheusRemoteWriteAuth::Bearer { token }) => {
                 Some(Auth::Basic(crate::http::Auth::Bearer {
                     token: token.clone(),
+                    token_file: "".to_string(),
                 }))
             }
             #[cfg(feature = "aws-core")]
