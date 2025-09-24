@@ -49,7 +49,7 @@ impl Partitioner for KeyPartitioner {
         let database = Self::render(&self.database, item, "database_key")?;
         let table = Self::render(&self.table, item, "table_key")?;
         Some(PartitionKey {
-            database: database,
+            database,
             table,
         })
     }
@@ -84,7 +84,7 @@ pub struct ClickhouseService {
 }
 
 impl ClickhouseService {
-    pub fn new(client: Client) -> Self {
+    pub const fn new(client: Client) -> Self {
         Self { client }
     }
 }
@@ -215,6 +215,31 @@ impl TryFrom<Event> for MetricsRow {
                 MetricValue::Counter { value } => Ok(value.to_owned()),
                 MetricValue::Gauge { value } => Ok(value.to_owned()),
                 MetricValue::Set { values } => Ok(values.len() as f64),
+                MetricValue::Distribution { samples, .. } => {
+                    // 使用样本平均值
+                    if samples.is_empty() {
+                        Ok(0.0)
+                    } else {
+                        let sum: f64 = samples.iter().map(|s| s.value).sum();
+                        Ok(sum / samples.len() as f64)
+                    }
+                }
+                MetricValue::AggregatedHistogram { count, sum, .. } => {
+                    // 用总和 / 总数来取平均
+                    if *count == 0 {
+                        Ok(0.0)
+                    } else {
+                        Ok(*sum / *count as f64)
+                    }
+                }
+                MetricValue::AggregatedSummary { count, sum, .. } => {
+                    // 同样用平均值
+                    if *count == 0 {
+                        Ok(0.0)
+                    } else {
+                        Ok(*sum / *count as f64)
+                    }
+                }
                 _ => Err(ClickhouseMetricsError::UnsupportedMetricValueType(
                     metric.value().to_string(),
                 )),
