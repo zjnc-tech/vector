@@ -21,6 +21,7 @@ use vector_lib::configurable::configurable_component;
     clippy::missing_const_for_fn
 )]
 mod bindings;
+#[allow(non_upper_case_globals)]
 mod collector;
 mod dcgm_field_maps;
 
@@ -64,11 +65,22 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
         let out = cx.out.clone();
         let groups = self.groups.clone();
 
+        // 检查DCGM库是否可用
+        let handle = match collector::init_dcgm() {
+            Ok(handle) => {
+                info!("DCGM initialized with handle: {}", handle);
+                handle
+            }
+            Err(e) => {
+                error!("DCGM library not available: {}", e);
+                return Err("DCGM library not available".into());
+            }
+        };
+
         let mut field_groups = resolve_all_fields(&self.groups)?.clone();
 
         // 为每个字段组添加DCGM_FI_DEV_UUID
         for fields in field_groups.values_mut() {
-            // 添加DCGM_FI_DEV_UUID，避免重复添加
             if !fields.contains(&(DCGM_FI_DEV_UUID as u16)) {
                 fields.push(DCGM_FI_DEV_UUID as u16);
             }
@@ -78,10 +90,7 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
         }
 
         Ok(Box::pin(async move {
-            let handle = collector::init_dcgm().map_err(|e| {
-                error!("DCGM init failed: {}", e);
-            })?;
-
+            // 移除重复的初始化调用
             let pod_mapper = pod_resource_mapper::PodResourcesMapper::new();
             let refresher = pod_resource_mapper::PodResourcesRefresher::new(pod_mapper.clone());
             tokio::spawn(async move {
@@ -95,6 +104,7 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
                 let mut out = out.clone();
                 let shutdown = shutdown.clone();
                 let pod_mapper = pod_mapper.clone();
+                let handle = handle;
 
                 let join = tokio::spawn(async move {
                     let interval =
@@ -128,7 +138,15 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
                                             break;
                                         }
                                     }
-                                    Err(e) => warn!("Failed to collect group {}: {}", group_name, e),
+                                    Err(e) => {
+                                        // 如果是库不可用错误，记录一次后退出循环
+                                        if e == dcgmReturn_enum_DCGM_ST_LIBRARY_NOT_FOUND {
+                                            error!("DCGM library not available: {}", e);
+                                            break;
+                                        } else {
+                                            warn!("Failed to collect group {}: {}", group_name, e);
+                                        }
+                                    }
                                 }
                             }
                         }

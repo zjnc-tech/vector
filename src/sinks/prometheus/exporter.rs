@@ -320,9 +320,10 @@ fn authorized<T: HttpBody>(req: &Request<T>, auth: &Option<Auth>) -> bool {
                     )
                     .as_str(),
                 ),
-                Auth::Bearer { token, token_file: _ } => {
-                    HeaderValue::from_str(format!("Bearer {}", token.inner()).as_str())
-                }
+                Auth::Bearer {
+                    token,
+                    token_file: _,
+                } => HeaderValue::from_str(format!("Bearer {}", token.inner()).as_str()),
             };
 
             if let Ok(encoded_credentials) = encoded_credentials {
@@ -714,6 +715,7 @@ mod tests {
 
         let auth_config = Auth::Bearer {
             token: SensitiveString::from("token".to_string()),
+            token_file: "".to_string(),
         };
 
         let response_result =
@@ -750,6 +752,7 @@ mod tests {
 
         let server_auth_config = Auth::Bearer {
             token: SensitiveString::from("token".to_string()),
+            token_file: "".to_string(),
         };
 
         let response_result =
@@ -767,6 +770,7 @@ mod tests {
 
         let server_auth_config = Auth::Bearer {
             token: SensitiveString::from("token".to_string()),
+            token_file: "".to_string(),
         };
 
         let client_auth_config = Auth::Basic {

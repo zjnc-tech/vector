@@ -1,13 +1,3 @@
-use chrono::Utc;
-use std::time::Duration;
-
-use crate::sources::lldp::ffi::{LldpInterface, LldpNeighbor};
-use crate::{
-    config::{SourceConfig, SourceContext, SourceOutput},
-    event::metric::{Metric, MetricKind, MetricTags, MetricValue},
-};
-use vector_lib::configurable::configurable_component;
-
 #[allow(
     improper_ctypes,
     unused_imports,
@@ -19,8 +9,18 @@ use vector_lib::configurable::configurable_component;
     clippy::trivially_copy_pass_by_ref,
     clippy::missing_const_for_fn
 )]
-mod bindings;
 mod ffi;
+
+use chrono::Utc;
+use std::time::Duration;
+
+use crate::{
+    config::{SourceConfig, SourceContext, SourceOutput},
+    event::metric::{Metric, MetricKind, MetricTags, MetricValue},
+};
+use vector_lib::configurable::configurable_component;
+
+use super::lldp::ffi::LldpError;
 
 /// Configuration for the `lldp` source.
 #[configurable_component(source("lldp", "Collect lldp data."))]
@@ -82,7 +82,15 @@ impl SourceConfig for LldpMetricsConfig {
                                     warn!("Failed to send LLDP interface batch");
                                 }
                             }
-                            Err(e) => warn!("LLDP interface error: {}", e),
+                            Err(e) => {
+                                // 如果是库不可用错误，记录一次后退出循环
+                                if let LldpError::LibraryNotAvailable(_) = e {
+                                    error!("LLDP library not available: {}", e);
+                                    break;
+                                } else {
+                                    warn!("LLDP interface error: {}", e);
+                                }
+                            }
                         }
                     }
 
@@ -97,7 +105,15 @@ impl SourceConfig for LldpMetricsConfig {
                                     warn!("Failed to send LLDP link batch");
                                 }
                             }
-                            Err(e) => warn!("LLDP link error: {}", e),
+                            Err(e) => {
+                                // 如果是库不可用错误，记录一次后退出循环
+                                if let LldpError::LibraryNotAvailable(_) = e {
+                                    error!("LLDP library not available: {}", e);
+                                    break;
+                                } else {
+                                    warn!("LLDP link error: {}", e);
+                                }
+                            }
                         }
                     }
 
@@ -120,7 +136,10 @@ impl SourceConfig for LldpMetricsConfig {
     }
 }
 
-pub fn map_interfaces_to_metrics(interfaces: Vec<LldpInterface>, config: &Config) -> Vec<Metric> {
+pub fn map_interfaces_to_metrics(
+    interfaces: Vec<ffi::LldpInterface>,
+    config: &Config,
+) -> Vec<Metric> {
     let now = Utc::now();
     let mut metrics = Vec::new();
 
@@ -147,7 +166,7 @@ pub fn map_interfaces_to_metrics(interfaces: Vec<LldpInterface>, config: &Config
 }
 
 pub fn map_neighbors_to_interface_and_link(
-    neighbors: Vec<LldpNeighbor>,
+    neighbors: Vec<ffi::LldpNeighbor>,
     config: &Config,
 ) -> (Vec<Metric>, Vec<Metric>) {
     let mut interface_metrics = Vec::new();

@@ -11666,6 +11666,7 @@ dependencies = [
  "kube",
  "lapin",
  "libc",
+ "libloading",
  "listenfd",
  "loki-logproto",
  "lru 0.13.0",

@@ -361,6 +361,7 @@ itertools = { version = "0.14.0", default-features = false, optional = false, fe
 k8s-openapi = { version = "0.22.0", default-features = false, features = ["v1_26"], optional = true }
 kube = { version = "0.93.0", default-features = false, features = ["client", "openssl-tls", "runtime"], optional = true }
 libc = "0.2.171"
+libloading = "0.8"
 listenfd = { version = "1.0.2", default-features = false, optional = true }
 lru = { version = "0.13.0", default-features = false, optional = true }
 maxminddb = { version = "0.26.0", default-features = false, optional = true, features = ["simdutf8"] }
