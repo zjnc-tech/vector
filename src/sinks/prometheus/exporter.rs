@@ -715,6 +715,7 @@ mod tests {
 
         let auth_config = Auth::Bearer {
             token: SensitiveString::from("token".to_string()),
+            token_file: "".to_string(),
         };
 
         let response_result =
@@ -751,6 +752,7 @@ mod tests {
 
         let server_auth_config = Auth::Bearer {
             token: SensitiveString::from("token".to_string()),
+            token_file: "".to_string(),
         };
 
         let response_result =
@@ -768,6 +770,7 @@ mod tests {
 
         let server_auth_config = Auth::Bearer {
             token: SensitiveString::from("token".to_string()),
+            token_file: "".to_string(),
         };
 
         let client_auth_config = Auth::Basic {

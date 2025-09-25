@@ -333,7 +333,7 @@ impl Auth {
                 map.typed_insert(auth);
             }
             Auth::Bearer { token, token_file } => {
-                if token_file != "" {
+                if !token_file.is_empty() {
                     match std::fs::read_to_string(token_file) {
                         Ok(contents) => {
                             let token = contents.trim();
