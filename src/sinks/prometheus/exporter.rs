@@ -320,9 +320,10 @@ fn authorized<T: HttpBody>(req: &Request<T>, auth: &Option<Auth>) -> bool {
                     )
                     .as_str(),
                 ),
-                Auth::Bearer { token, token_file: _ } => {
-                    HeaderValue::from_str(format!("Bearer {}", token.inner()).as_str())
-                }
+                Auth::Bearer {
+                    token,
+                    token_file: _,
+                } => HeaderValue::from_str(format!("Bearer {}", token.inner()).as_str()),
             };
 
             if let Ok(encoded_credentials) = encoded_credentials {

@@ -1,6 +1,6 @@
-mod errors;
 #[allow(dead_code)]
 mod device;
+mod errors;
 use serde_with::serde_as;
 use std::time::Duration;
 use vector_lib::{config::DataType, schema};

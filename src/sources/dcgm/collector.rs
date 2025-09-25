@@ -216,10 +216,16 @@ pub fn register_fields(
                         warn!("  group_type: {}", dcgmGroupType_enum_DCGM_GROUP_DEFAULT);
                         warn!("  group_name: {:?}", group_name_cstr);
                         warn!("  group_id_ptr: {:?}", &mut group_id);
-                    },
-                    dcgmReturn_enum_DCGM_ST_INIT_ERROR => warn!("DCGM_ST_INIT_ERROR: DCGM has not been initialized"),
-                    dcgmReturn_enum_DCGM_ST_NOT_SUPPORTED => warn!("DCGM_ST_NOT_SUPPORTED: Function not supported"),
-                    dcgmReturn_enum_DCGM_ST_LIBRARY_NOT_FOUND => warn!("DCGM_ST_LIBRARY_NOT_FOUND: DCGM library not found"),
+                    }
+                    dcgmReturn_enum_DCGM_ST_INIT_ERROR => {
+                        warn!("DCGM_ST_INIT_ERROR: DCGM has not been initialized")
+                    }
+                    dcgmReturn_enum_DCGM_ST_NOT_SUPPORTED => {
+                        warn!("DCGM_ST_NOT_SUPPORTED: Function not supported")
+                    }
+                    dcgmReturn_enum_DCGM_ST_LIBRARY_NOT_FOUND => {
+                        warn!("DCGM_ST_LIBRARY_NOT_FOUND: DCGM library not found")
+                    }
                     _ => warn!("Other DCGM error: {}", ret),
                 }
                 return Err(ret);
@@ -234,7 +240,10 @@ pub fn register_fields(
                 &mut field_group_id,
             );
             if ret != dcgmReturn_enum_DCGM_ST_OK {
-                warn!("dcgmFieldGroupCreate failed: {} for field group '{}'", ret, field_group_name);
+                warn!(
+                    "dcgmFieldGroupCreate failed: {} for field group '{}'",
+                    ret, field_group_name
+                );
                 return Err(ret);
             }
 
@@ -245,7 +254,7 @@ pub fn register_fields(
                 field_group_id,
                 update_freq_usec as c_longlong,
                 600.0, // 10分钟超时
-                1, // 1表示立即返回，而不是等待第一次数据收集
+                1,     // 1表示立即返回，而不是等待第一次数据收集
             );
 
             if watch_ret != dcgmReturn_enum_DCGM_ST_OK {

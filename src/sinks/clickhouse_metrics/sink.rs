@@ -29,7 +29,10 @@ impl ClickhouseMetricsSink {
     ) -> crate::Result<Self> {
         let (user, passwd) = match auth {
             Auth::Basic { user, password } => Ok((user, password)),
-            Auth::Bearer { token: _ , token_file: _} => Err(Box::new(ClickhouseMetricsError::BearerUnsupported)),
+            Auth::Bearer {
+                token: _,
+                token_file: _,
+            } => Err(Box::new(ClickhouseMetricsError::BearerUnsupported)),
         }?;
 
         let ck_client = Client::default()

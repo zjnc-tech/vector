@@ -574,7 +574,10 @@ mod tests {
                                     let hdr = req.headers().get("Authorization");
                                     if let Some(h) = hdr {
                                         match a {
-                                            Auth::Bearer { token, token_file: _ } => {
+                                            Auth::Bearer {
+                                                token,
+                                                token_file: _,
+                                            } => {
                                                 if format!("Bearer {}", token.inner())
                                                     != h.to_str().unwrap()
                                                 {

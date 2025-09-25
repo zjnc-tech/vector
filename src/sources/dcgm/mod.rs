@@ -70,7 +70,7 @@ impl SourceConfig for crate::sources::dcgm::DcgmMetricsConfig {
             Ok(handle) => {
                 info!("DCGM initialized with handle: {}", handle);
                 handle
-            },
+            }
             Err(e) => {
                 error!("DCGM library not available: {}", e);
                 return Err("DCGM library not available".into());

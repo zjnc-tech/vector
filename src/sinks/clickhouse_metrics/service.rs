@@ -48,10 +48,7 @@ impl Partitioner for KeyPartitioner {
     fn partition(&self, item: &Self::Item) -> Self::Key {
         let database = Self::render(&self.database, item, "database_key")?;
         let table = Self::render(&self.table, item, "table_key")?;
-        Some(PartitionKey {
-            database,
-            table,
-        })
+        Some(PartitionKey { database, table })
     }
 }
 
