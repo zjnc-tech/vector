@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -7,7 +6,7 @@ use http::{response::Parts, Uri};
 use serde_with::serde_as;
 use snafu::ResultExt;
 use vector_lib::configurable::configurable_component;
-use vector_lib::{config::LogNamespace, event::Event};
+use vector_lib::{config::LogNamespace, event::{Event, Metric}};
 
 use super::parser;
 use crate::http::QueryParameters;
@@ -28,6 +27,23 @@ use crate::{
     Result,
 };
 
+use typetag::serde;
+use std::collections::HashMap;
+
+
+// 在文件开头添加导入
+use super::k8s_discovery::{
+    K8sServiceDiscovery, 
+    PodMetadata, 
+    KubernetesSdConfig as K8sSdConfig,
+    MetadataLabelsConfig,
+    DiscoveredTarget,
+    ServiceMetadata,
+    NodeMetadata,
+};
+use hyper::Body;
+use crate::http::HttpClient;
+
 // pulled up, and split over multiple lines, because the long lines trip up rustfmt such that it
 // gave up trying to format, but reported no error
 static PARSE_ERROR_NO_PATH: &str = "No path is set on the endpoint and we got a parse error,\
@@ -47,6 +63,7 @@ pub struct PrometheusScrapeConfig {
     /// Endpoints to scrape metrics from.
     #[configurable(metadata(docs::examples = "http://localhost:9090/metrics"))]
     #[serde(alias = "hosts")]
+    #[serde(default)] 
     endpoints: Vec<String>,
 
     /// The interval between scrapes. Requests are run concurrently so if a scrape takes longer
@@ -103,6 +120,15 @@ pub struct PrometheusScrapeConfig {
     #[configurable(derived)]
     #[configurable(metadata(docs::advanced))]
     auth: Option<Auth>,
+
+    // 新增：Kubernetes 服务发现配置
+    /// Configuration for Kubernetes service discovery.
+    ///
+    /// When enabled, automatically discovers Prometheus targets from Kubernetes resources
+    /// such as pods, services, or endpoints.
+    #[serde(default)]
+    #[configurable(metadata(docs::advanced))]
+    pub kubernetes_sd: Option<K8sSdConfig>,  // 使用导入的类型
 }
 
 fn query_example() -> serde_json::Value {
@@ -126,6 +152,7 @@ impl GenerateConfig for PrometheusScrapeConfig {
             query: HashMap::new(),
             tls: None,
             auth: None,
+            kubernetes_sd: None,
         })
         .unwrap()
     }
@@ -135,35 +162,44 @@ impl GenerateConfig for PrometheusScrapeConfig {
 #[typetag::serde(name = "prometheus_scrape")]
 impl SourceConfig for PrometheusScrapeConfig {
     async fn build(&self, cx: SourceContext) -> Result<sources::Source> {
-        let urls = self
-            .endpoints
-            .iter()
-            .map(|s| s.parse::<Uri>().context(sources::UriParseSnafu))
-            .map(|r| r.map(|uri| build_url(&uri, &self.query)))
-            .collect::<std::result::Result<Vec<Uri>, sources::BuildError>>()?;
-        let tls = TlsSettings::from_options(self.tls.as_ref())?;
+        // ====== 修改点 1: 改变 urls 的获取方式 ======
+       if let Some(ref k8s_config) = self.kubernetes_sd {
+            // Kubernetes 服务发现模式
+            self.build_k8s_scraper(k8s_config, cx).await
+        } else {
+            // 使用静态 endpoints（保持原来的逻辑）
+            let urls = self
+                .endpoints
+                .iter()
+                .map(|s| s.parse::<Uri>().context(sources::UriParseSnafu))
+                .map(|r| r.map(|uri| build_url(&uri, &self.query)))
+                .collect::<std::result::Result<Vec<Uri>, sources::BuildError>>()?;
 
-        let builder = PrometheusScrapeBuilder {
-            honor_labels: self.honor_labels,
-            instance_tag: self.instance_tag.clone(),
-            endpoint_tag: self.endpoint_tag.clone(),
-        };
+            let tls = TlsSettings::from_options(self.tls.as_ref())?;
 
-        warn_if_interval_too_low(self.timeout, self.interval);
+            let builder = PrometheusScrapeBuilder {
+                honor_labels: self.honor_labels,
+                instance_tag: self.instance_tag.clone(),
+                endpoint_tag: self.endpoint_tag.clone(),
+            };
 
-        let inputs = GenericHttpClientInputs {
-            urls,
-            interval: self.interval,
-            timeout: self.timeout,
-            headers: HashMap::new(),
-            content_type: "text/plain".to_string(),
-            auth: self.auth.clone(),
-            tls,
-            proxy: cx.proxy.clone(),
-            shutdown: cx.shutdown,
-        };
+            warn_if_interval_too_low(self.timeout, self.interval);
 
-        Ok(call(inputs, builder, cx.out, HttpMethod::Get).boxed())
+            let inputs = GenericHttpClientInputs {
+                urls,
+                interval: self.interval,
+                timeout: self.timeout,
+                headers: HashMap::new(),
+                content_type: "text/plain".to_string(),
+                auth: self.auth.clone(),
+                tls,
+                proxy: cx.proxy.clone(),
+                shutdown: cx.shutdown,
+            };
+
+            Ok(call(inputs, builder, cx.out, HttpMethod::Get).boxed())
+        }
+
     }
 
     fn outputs(&self, _global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
@@ -195,6 +231,278 @@ struct EndpointInfo {
     honor_label: bool,
 }
 
+impl PrometheusScrapeConfig {
+    /// 构建 Kubernetes 服务发现模式的 scraper
+    async fn build_k8s_scraper(
+        &self,
+        k8s_config: &K8sSdConfig,
+        cx: SourceContext,
+    ) -> Result<sources::Source> {
+        let discovery = K8sServiceDiscovery::new(k8s_config.clone()).await?;
+        
+        let interval = self.interval;
+        let timeout = self.timeout;
+        let tls_config = self.tls.clone();
+        let auth = self.auth.clone();
+        let proxy = cx.proxy.clone();
+        let shutdown = cx.shutdown.clone();
+        let mut out = cx.out.clone();
+        let query_params = self.query.clone();
+        let honor_labels = self.honor_labels;
+        let instance_tag = self.instance_tag.clone();
+        let endpoint_tag = self.endpoint_tag.clone();
+        let metadata_labels = k8s_config.metadata_labels.clone();
+        
+        Ok(Box::pin(async move {
+            let tls = TlsSettings::from_options(tls_config.as_ref())
+                .expect("Failed to build TLS settings");
+            let client = HttpClient::new(tls, &proxy)
+                .expect("Failed to build HTTP client");
+            
+            let mut interval_timer = tokio::time::interval(interval);
+            
+            loop {
+                tokio::select! {
+                    _ = shutdown.clone() => {
+                        info!("Shutting down Kubernetes scraper");
+                        break;
+                    }
+                    _ = interval_timer.tick() => {
+                        let targets = discovery.get_targets().await;
+                        
+                        if targets.is_empty() {
+                            warn!("No Kubernetes targets discovered");
+                            continue;
+                        }
+                        
+                        info!("Scraping {} Kubernetes targets", targets.len());
+                        
+                        let futures: Vec<_> = targets.into_iter().map(|target| {
+                            info!("Creating future for target: {}", target.url); 
+                            Self::scrape_target(
+                                target,
+                                client.clone(),
+                                auth.clone(),
+                                query_params.clone(),
+                                timeout,
+                                honor_labels,
+                                instance_tag.clone(),
+                                endpoint_tag.clone(),
+                                metadata_labels.clone(),
+                            )
+                        }).collect();
+                        
+                        let results = futures::future::join_all(futures).await;
+                        
+                        for events in results {
+                            if !events.is_empty() {
+                                if let Err(e) = out.send_batch(events).await {
+                                    error!("Failed to send events: {:?}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            Ok(())
+        }))
+    }
+    
+    /// 抓取单个 target 的 metrics
+    async fn scrape_target(
+        target: DiscoveredTarget,
+        client: HttpClient,
+        auth: Option<Auth>,
+        query_params: QueryParameters,
+        timeout: Duration,
+        honor_labels: bool,
+        instance_tag: Option<String>,
+        endpoint_tag: Option<String>,
+        metadata_config: MetadataLabelsConfig,
+    ) -> Vec<Event> {
+        // 添加调试日志
+        info!(
+            "Scraping target: {} | metadata_config: namespace={}, pod_name={}, node_name={}, pod_ip={}, node_ip={}",
+            target.url,
+            metadata_config.namespace,
+            metadata_config.pod_name,
+            metadata_config.node_name,
+            metadata_config.pod_ip,
+            metadata_config.node_ip
+        );
+        
+        if let Some(ref pod_meta) = target.pod_metadata {
+            info!(
+                "Pod metadata: namespace={}, pod_name={}, pod_ip={:?}, node={:?}",
+                pod_meta.namespace,
+                pod_meta.name,
+                pod_meta.pod_ip,
+                target.node_metadata.as_ref().map(|n| format!("{}({:?})", n.name, n.node_ip))
+            );
+        } else {
+            warn!("No pod_metadata for target {}", target.url);
+        }
+
+
+        let uri = match target.url.parse::<Uri>() {
+            Ok(u) => build_url(&u, &query_params),
+            Err(e) => {
+                error!("Invalid URL {}: {:?}", target.url, e);
+                return Vec::new();
+            }
+        };
+        
+        let mut request = hyper::Request::builder()
+            .method("GET")
+            .uri(uri.clone())
+            .header("Accept", "text/plain");
+        
+        if let Some(ref auth) = auth {
+            request = auth.apply_builder(request);
+        }
+        
+        let request = match request.body(Body::empty()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to build request: {:?}", e);
+                return Vec::new();
+            }
+        };
+        
+        let response = match tokio::time::timeout(timeout, client.send(request)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                error!("HTTP error for {}: {:?}", uri, e);
+                return Vec::new();
+            }
+            Err(_) => {
+                error!("Timeout for {}", uri);
+                return Vec::new();
+            }
+        };
+        
+        let (parts, body) = response.into_parts();
+        if parts.status != hyper::StatusCode::OK {
+            error!("HTTP {} from {}", parts.status, uri);
+            return Vec::new();
+        }
+        
+        let body_bytes = match hyper::body::to_bytes(body).await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to read body: {:?}", e);
+                return Vec::new();
+            }
+        };
+        
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        let mut events = match parser::parse_text(&body_str) {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Failed to parse metrics from {}: {:?}", uri, e);
+                return Vec::new();
+            }
+        };
+        
+        for event in &mut events {
+            let metric = event.as_mut_metric();
+            
+            if let Some(ref tag) = instance_tag {
+                let instance = format!("{}:{}", 
+                    uri.host().unwrap_or_default(),
+                    uri.port_u16().unwrap_or(80)
+                );
+                if !honor_labels || metric.tag_value(tag).is_none() {
+                    metric.replace_tag(tag.clone(), instance);
+                }
+            }
+            
+            if let Some(ref tag) = endpoint_tag {
+                let endpoint = uri.to_string();
+                if !honor_labels || metric.tag_value(tag).is_none() {
+                    metric.replace_tag(tag.clone(), endpoint);
+                }
+            }
+            
+            let prefix = &metadata_config.label_prefix;
+            metric.replace_tag(
+                        format!("{}endpoint", prefix),
+                        target.url.clone()
+                );
+            // 1. 添加 Pod 元数据
+            if let Some(ref pod_meta) = target.pod_metadata {
+                if metadata_config.namespace {
+                    metric.replace_tag(
+                        format!("{}namespace", prefix),
+                        pod_meta.namespace.clone()
+                    );
+                }
+                
+                if metadata_config.pod_name {
+                    metric.replace_tag(
+                        format!("{}pod", prefix),
+                        pod_meta.name.clone()
+                    );
+                }
+                
+                if metadata_config.pod_ip {
+                    if let Some(ref pod_ip) = pod_meta.pod_ip {
+                        metric.replace_tag(
+                            format!("{}pod_ip", prefix),
+                            pod_ip.clone()
+                        );
+                    }
+                }
+                
+                // Pod labels 和 annotations
+                if !metadata_config.pod_labels.is_none() || !metadata_config.pod_annotations.is_none() {
+                    add_pod_metadata_to_metric(metric, pod_meta, &metadata_config);
+                }
+            }
+            
+            // 2. 添加 Node 元数据 (从 target.node_metadata 直接获取,不再从 pod_metadata 里取)
+            if let Some(ref node_meta) = target.node_metadata {
+                if metadata_config.node_name {
+                    metric.replace_tag(
+                        format!("{}node", prefix),
+                        node_meta.name.clone()
+                    );
+                }
+                
+                if metadata_config.node_ip {
+                    if let Some(ref node_ip) = node_meta.node_ip {
+                        metric.replace_tag(
+                            format!("{}node_ip", prefix),
+                            node_ip.clone()
+                        );
+                    }
+                }
+                
+                // Node labels
+                if !metadata_config.node_labels.is_none() {
+                    add_node_metadata_to_metric(metric, node_meta, &metadata_config);
+                }
+            }
+            
+            // 3. 添加 Service 元数据
+            if let Some(ref service_meta) = target.service_metadata {
+                // Service name 总是添加
+                metric.replace_tag(
+                    format!("{}service", prefix),
+                    service_meta.name.clone()
+                );
+                
+                // Service labels 和 annotations
+                if !metadata_config.service_labels.is_none() || !metadata_config.service_annotations.is_none() {
+                    add_service_metadata_to_metric(metric, service_meta, &metadata_config);
+                }
+            }
+        }
+        
+        events
+    }
+}
 /// Captures the configuration options required to build request-specific context.
 #[derive(Clone)]
 struct PrometheusScrapeBuilder {
@@ -229,6 +537,7 @@ impl HttpClientBuilder for PrometheusScrapeBuilder {
             endpoint: url.to_string(),
             honor_label: self.honor_labels,
         });
+
         PrometheusScrapeContext {
             instance_info,
             endpoint_info,
@@ -368,6 +677,7 @@ mod test {
             query: HashMap::new(),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -402,6 +712,7 @@ mod test {
             query: HashMap::new(),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -454,6 +765,7 @@ mod test {
             query: HashMap::new(),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -520,6 +832,7 @@ mod test {
             query: HashMap::new(),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -585,6 +898,7 @@ mod test {
             ]),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -687,6 +1001,7 @@ mod test {
                 timeout: default_timeout(),
                 tls: None,
                 auth: None,
+                kubernetes_sd: None,
             },
         );
         config.add_sink(
@@ -839,4 +1154,132 @@ mod integration_tests {
             Some("http://prometheus:9090/metrics".to_string())
         );
     }
+}
+
+/// 只添加 Pod labels 和 annotations (基础字段在主流程中处理)
+fn add_pod_metadata_to_metric(
+    metric: &mut Metric,
+    pod_metadata: &PodMetadata,
+    config: &MetadataLabelsConfig,
+) {
+    let prefix = &config.label_prefix;
+    
+    // Pod labels - 根据选择器处理
+    if config.pod_labels.is_all() {
+        for (key, value) in &pod_metadata.labels {
+            metric.replace_tag(
+                format!("{}pod_label_{}", prefix, sanitize_label_name(key)),
+                value.clone()
+            );
+        }
+    } else if let Some(keys) = config.pod_labels.keys() {
+        for key in keys {
+            if let Some(value) = pod_metadata.labels.get(key) {
+                metric.replace_tag(
+                    format!("{}pod_label_{}", prefix, sanitize_label_name(key)),
+                    value.clone()
+                );
+            }
+        }
+    }
+    
+    // Pod annotations - 根据选择器处理
+    if config.pod_annotations.is_all() {
+        for (key, value) in &pod_metadata.annotations {
+            metric.replace_tag(
+                format!("{}pod_annotation_{}", prefix, sanitize_label_name(key)),
+                value.clone()
+            );
+        }
+    } else if let Some(keys) = config.pod_annotations.keys() {
+        for key in keys {
+            if let Some(value) = pod_metadata.annotations.get(key) {
+                metric.replace_tag(
+                    format!("{}pod_annotation_{}", prefix, sanitize_label_name(key)),
+                    value.clone()
+                );
+            }
+        }
+    }
+}
+
+// 类似地添加 Service 和 Node 的处理函数
+fn add_service_metadata_to_metric(
+    metric: &mut Metric,
+    service_metadata: &ServiceMetadata,
+    config: &MetadataLabelsConfig,
+) {
+    let prefix = &config.label_prefix;
+    
+    // Service labels
+    if config.service_labels.is_all() {
+        for (key, value) in &service_metadata.labels {
+            metric.replace_tag(
+                format!("{}service_label_{}", prefix, sanitize_label_name(key)),
+                value.clone()
+            );
+        }
+    } else if let Some(keys) = config.service_labels.keys() {
+        for key in keys {
+            if let Some(value) = service_metadata.labels.get(key) {
+                metric.replace_tag(
+                    format!("{}service_label_{}", prefix, sanitize_label_name(key)),
+                    value.clone()
+                );
+            }
+        }
+    }
+    
+    // Service annotations
+    if config.service_annotations.is_all() {
+        for (key, value) in &service_metadata.annotations {
+            metric.replace_tag(
+                format!("{}service_annotation_{}", prefix, sanitize_label_name(key)),
+                value.clone()
+            );
+        }
+    } else if let Some(keys) = config.service_annotations.keys() {
+        for key in keys {
+            if let Some(value) = service_metadata.annotations.get(key) {
+                metric.replace_tag(
+                    format!("{}service_annotation_{}", prefix, sanitize_label_name(key)),
+                    value.clone()
+                );
+            }
+        }
+    }
+}
+
+/// 只添加 Node labels (Node 没有 annotations)
+fn add_node_metadata_to_metric(
+    metric: &mut Metric,
+    node_metadata: &NodeMetadata,
+    config: &MetadataLabelsConfig,
+) {
+    let prefix = &config.label_prefix;
+    
+    // Node labels
+    if config.node_labels.is_all() {
+        for (key, value) in &node_metadata.labels {
+            metric.replace_tag(
+                format!("{}node_label_{}", prefix, sanitize_label_name(key)),
+                value.clone()
+            );
+        }
+    } else if let Some(keys) = config.node_labels.keys() {
+        for key in keys {
+            if let Some(value) = node_metadata.labels.get(key) {
+                metric.replace_tag(
+                    format!("{}node_label_{}", prefix, sanitize_label_name(key)),
+                    value.clone()
+                );
+            }
+        }
+    }
+}
+
+fn sanitize_label_name(name: &str) -> String {
+    name.replace('.', "_")
+        .replace('/', "_")
+        .replace('-', "_")
 }
