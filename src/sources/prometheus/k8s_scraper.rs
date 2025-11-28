@@ -1,7 +1,6 @@
 use std::time::Duration;
 use http::Uri;
 use hyper::Body;
-use vector_lib::event::Event;
 
 use super::k8s_discovery::{
     K8sServiceDiscovery,
@@ -16,6 +15,8 @@ use crate::http::{Auth, HttpClient, QueryParameters};
 use crate::sources::util::http_client::build_url;
 use crate::tls::TlsSettings;
 use crate::SourceSender;
+use vector_lib::event::{Event, Metric};
+use vector_lib::event::metric::{MetricKind, MetricValue};
 
 /// Kubernetes 服务发现抓取器
 pub struct K8sScraper {
@@ -132,7 +133,8 @@ impl K8sScraper {
             Ok(u) => build_url(&u, &query_params),
             Err(e) => {
                 error!("Invalid URL {}: {:?}", target.url, e);
-                return Vec::new();
+                return vec![Self::build_up_event(&target, &metadata_config, 0)];
+                // return Vec::new();
             }
         };
         
@@ -149,7 +151,7 @@ impl K8sScraper {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to build request: {:?}", e);
-                return Vec::new();
+                return vec![Self::build_up_event(&target,  &metadata_config, 0)];
             }
         };
         
@@ -157,25 +159,25 @@ impl K8sScraper {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 error!("HTTP error for {}: {:?}", uri, e);
-                return Vec::new();
+                return vec![Self::build_up_event( &target,  &metadata_config, 0)];
             }
             Err(_) => {
                 error!("Timeout for {}", uri);
-                return Vec::new();
+                return vec![Self::build_up_event( &target,  &metadata_config, 0)];
             }
         };
         
         let (parts, body) = response.into_parts();
         if parts.status != hyper::StatusCode::OK {
             error!("HTTP {} from {}", parts.status, uri);
-            return Vec::new();
+            return vec![Self::build_up_event( &target,  &metadata_config, 0)];
         }
         
         let body_bytes = match hyper::body::to_bytes(body).await {
             Ok(b) => b,
             Err(e) => {
                 error!("Failed to read body: {:?}", e);
-                return Vec::new();
+                return vec![Self::build_up_event( &target,  &metadata_config, 0)];
             }
         };
         
@@ -184,7 +186,7 @@ impl K8sScraper {
             Ok(e) => e,
             Err(e) => {
                 error!("Failed to parse metrics from {}: {:?}", uri, e);
-                return Vec::new();
+                return vec![Self::build_up_event(&target,  &metadata_config, 0)];
             }
         };
         
@@ -210,7 +212,31 @@ impl K8sScraper {
             
             add_metadata_to_metric(metric, &target, &metadata_config, honor_labels);
         }
+
+        // 追加 up=1 指标事件
+        events.push(Self::build_up_event(
+            &target,
+            &metadata_config,
+            1,
+        ));
         
         events
+    }
+    
+    /// 构建 up 事件
+    fn build_up_event(
+        target: &DiscoveredTarget,
+        metadata_config: &MetadataLabelsConfig,
+        up: i64,
+    ) -> Event {
+        // 创建一个 gauge 型的 up 指标
+        let mut metric = Metric::new(
+            "up".to_string(),
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: up as f64 },
+        );
+
+        add_metadata_to_metric(&mut metric, target, metadata_config, false);
+        Event::from(metric)
     }
 }
