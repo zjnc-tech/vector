@@ -208,7 +208,7 @@ impl K8sScraper {
                 }
             }
             
-            add_metadata_to_metric(metric, &target, &metadata_config);
+            add_metadata_to_metric(metric, &target, &metadata_config, honor_labels);
         }
         
         events
