@@ -39,6 +39,10 @@ pub struct KubernetesSdConfig {
     #[serde(default)]
     pub metadata_labels: MetadataLabelsConfig,
 
+    /// URL scheme for scraping endpoints. Can be "http" or "https".
+    #[serde(default = "default_scheme")]
+    pub scheme: String,
+
     /// Port name or number to scrape. If not specified, scrapes all ports.
     /// Can be a port name (e.g., "metrics") or port number (e.g., "9090").
     /// Examples: "metrics", "9090", "prometheus"
@@ -48,6 +52,10 @@ pub struct KubernetesSdConfig {
     /// Metric path to scrape. Defaults to "/metrics".
     #[serde(default = "default_metrics_path")]
     pub metrics_path: String,
+}
+
+fn default_scheme() -> String {
+    "http".to_string()
 }
 
 fn default_metrics_path() -> String {
@@ -414,7 +422,8 @@ impl K8sServiceDiscovery {
                                 
                                 // 使用配置的 metrics_path
                                 let url = format!(
-                                    "http://{}:{}{}",
+                                    "{}://{}:{}{}",
+                                    self.config.scheme,  // ← 使用配置的 scheme
                                     address.ip,
                                     port.port,
                                     self.config.metrics_path
