@@ -1,6 +1,8 @@
 use std::time::Duration;
 use http::Uri;
 use hyper::Body;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use super::k8s_discovery::{
     K8sServiceDiscovery,
@@ -10,6 +12,7 @@ use super::k8s_discovery::{
 };
 use super::parser;
 use super::metrics_enrichment::add_metadata_to_metric;
+use super::metadata_cache::MetadataCache;
 use crate::config::ProxyConfig;
 use crate::http::{Auth, HttpClient, QueryParameters};
 use crate::sources::util::http_client::build_url;
@@ -18,7 +21,6 @@ use crate::SourceSender;
 use vector_lib::event::{Event, Metric};
 use vector_lib::event::metric::{MetricKind, MetricValue};
 
-/// Kubernetes 服务发现抓取器
 pub struct K8sScraper {
     discovery: K8sServiceDiscovery,
     client: HttpClient,
@@ -62,7 +64,6 @@ impl K8sScraper {
         })
     }
     
-    /// 运行抓取循环
     pub async fn run(
         self,
         interval: Duration,
@@ -87,6 +88,8 @@ impl K8sScraper {
                     
                     info!("Scraping {} Kubernetes targets", targets.len());
                     
+                    let cache = self.discovery.metadata_cache.clone();
+                    
                     let futures: Vec<_> = targets.into_iter().map(|target| {
                         Self::scrape_target(
                             target,
@@ -98,6 +101,7 @@ impl K8sScraper {
                             self.instance_tag.clone(),
                             self.endpoint_tag.clone(),
                             self.metadata_config.clone(),
+                            cache.clone(),
                         )
                     }).collect();
                     
@@ -117,7 +121,6 @@ impl K8sScraper {
         Ok(())
     }
     
-    /// 抓取单个 target
     async fn scrape_target(
         target: DiscoveredTarget,
         client: HttpClient,
@@ -128,13 +131,13 @@ impl K8sScraper {
         instance_tag: Option<String>,
         endpoint_tag: Option<String>,
         metadata_config: MetadataLabelsConfig,
+        cache: Arc<RwLock<MetadataCache>>,
     ) -> Vec<Event> {
         let uri = match target.url.parse::<Uri>() {
             Ok(u) => build_url(&u, &query_params),
             Err(e) => {
                 error!("Invalid URL {}: {:?}", target.url, e);
-                return vec![Self::build_up_event(&target, &metadata_config, 0)];
-                // return Vec::new();
+                return vec![Self::build_up_event(&target, &metadata_config, 0, &cache).await];
             }
         };
         
@@ -151,7 +154,7 @@ impl K8sScraper {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to build request: {:?}", e);
-                return vec![Self::build_up_event(&target,  &metadata_config, 0)];
+                return vec![Self::build_up_event(&target, &metadata_config, 0, &cache).await];
             }
         };
         
@@ -159,25 +162,25 @@ impl K8sScraper {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 error!("HTTP error for {}: {:?}", uri, e);
-                return vec![Self::build_up_event( &target,  &metadata_config, 0)];
+                return vec![Self::build_up_event(&target, &metadata_config, 0, &cache).await];
             }
             Err(_) => {
                 error!("Timeout for {}", uri);
-                return vec![Self::build_up_event( &target,  &metadata_config, 0)];
+                return vec![Self::build_up_event(&target, &metadata_config, 0, &cache).await];
             }
         };
         
         let (parts, body) = response.into_parts();
         if parts.status != hyper::StatusCode::OK {
             error!("HTTP {} from {}", parts.status, uri);
-            return vec![Self::build_up_event( &target,  &metadata_config, 0)];
+            return vec![Self::build_up_event(&target, &metadata_config, 0, &cache).await];
         }
         
         let body_bytes = match hyper::body::to_bytes(body).await {
             Ok(b) => b,
             Err(e) => {
                 error!("Failed to read body: {:?}", e);
-                return vec![Self::build_up_event( &target,  &metadata_config, 0)];
+                return vec![Self::build_up_event(&target, &metadata_config, 0, &cache).await];
             }
         };
         
@@ -186,7 +189,7 @@ impl K8sScraper {
             Ok(e) => e,
             Err(e) => {
                 error!("Failed to parse metrics from {}: {:?}", uri, e);
-                return vec![Self::build_up_event(&target,  &metadata_config, 0)];
+                return vec![Self::build_up_event(&target, &metadata_config, 0, &cache).await];
             }
         };
         
@@ -210,33 +213,27 @@ impl K8sScraper {
                 }
             }
             
-            add_metadata_to_metric(metric, &target, &metadata_config, honor_labels);
+            add_metadata_to_metric(metric, &target, &metadata_config, honor_labels, &cache).await;
         }
 
-        // 追加 up=1 指标事件
-        events.push(Self::build_up_event(
-            &target,
-            &metadata_config,
-            1,
-        ));
+        events.push(Self::build_up_event(&target, &metadata_config, 1, &cache).await);
         
         events
     }
     
-    /// 构建 up 事件
-    fn build_up_event(
+    async fn build_up_event(
         target: &DiscoveredTarget,
         metadata_config: &MetadataLabelsConfig,
         up: i64,
+        cache: &Arc<RwLock<MetadataCache>>,
     ) -> Event {
-        // 创建一个 gauge 型的 up 指标
         let mut metric = Metric::new(
             "up".to_string(),
             MetricKind::Absolute,
             MetricValue::Gauge { value: up as f64 },
         );
 
-        add_metadata_to_metric(&mut metric, target, metadata_config, false);
+        add_metadata_to_metric(&mut metric, target, metadata_config, false, cache).await;
         Event::from(metric)
     }
 }
