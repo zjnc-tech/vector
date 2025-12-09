@@ -40,6 +40,11 @@ pub struct KubernetesSdConfig {
     #[serde(default)]
     pub metadata_labels: MetadataLabelsConfig,
 
+    /// job name to distinguish resources.
+    #[serde(default)]
+    // ✅ 必填字段，不使用 Option
+    pub job_name: String,
+
     /// URL scheme for scraping endpoints. Can be "http" or "https".
     #[serde(default = "default_scheme")]
     pub scheme: String,
@@ -188,6 +193,7 @@ pub struct DiscoveredTarget {
     pub node_name: Option<String>,
     pub service_name: Option<String>,
     pub service_namespace: Option<String>,
+    pub job_name: String,
 }
 
 // ============================================================================
@@ -690,6 +696,7 @@ impl K8sServiceDiscovery {
                                     node_name,
                                     service_name: Some(endpoints_name.clone()),
                                     service_namespace: Some(namespace.clone()),
+                                    job_name: self.config.job_name.clone(),
                                 });
                             }
                         }
@@ -859,6 +866,7 @@ impl K8sServiceDiscovery {
             node_name: Some(node_name.clone()),
             service_name: None,
             service_namespace: None,
+            job_name: self.config.job_name.clone(),
         });
         
         Ok(targets)
