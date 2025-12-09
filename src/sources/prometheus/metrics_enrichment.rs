@@ -13,6 +13,12 @@ pub async fn add_metadata_to_metric(
     cache: &Arc<RwLock<MetadataCache>>,
 ) {
 
+    // ✅ 添加 job 标签，job_name 是必填的，直接使用
+    let tag_name = format!("{}job", config.label_prefix);
+    if !honor_labels || metric.tag_value(&tag_name).is_none() {
+        metric.replace_tag(tag_name, target.job_name.clone());
+    }
+
     let endpoint = format!("{}endpoint", config.label_prefix);
     if !honor_labels || metric.tag_value(&endpoint).is_none() {
         metric.replace_tag(endpoint, target.url.clone());
