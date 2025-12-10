@@ -8,9 +8,9 @@ use serde::{Serialize, Deserialize};
 use tracing::{error, info, warn};
 use kube::runtime::WatchStreamExt;
 use vector_lib::configurable::Configurable;
-use tokio::time::Duration;
+use super::metadata_cache::{MetadataCache, get_node_name_from_pod}; 
+use super::cache_manager::{get_watch_manager, NamespaceWatchGuard, NodeWatchGuard};
 
-use super::metadata_cache::{MetadataCache, get_node_name_from_pod, PodMetadata, NodeMetadata, ServiceMetadata};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -95,7 +95,7 @@ pub struct MetadataLabelsConfig {
 
     /// Whether to add the node IP as a metric label.
     #[serde(default = "default_true")]
-    pub node_ip: bool,
+    pub host_ip: bool,
     
     /// Whether to add the pod IP as a metric label.
     #[serde(default = "default_true")]
@@ -165,7 +165,7 @@ impl Default for MetadataLabelsConfig {
             namespace: true,
             pod_name: true,
             node_name: true,
-            node_ip: true,
+            host_ip: true,
             pod_ip: true,
             service_labels: LabelSelector::Specific(vec![]),
             service_annotations: LabelSelector::Specific(vec![]),
@@ -204,7 +204,15 @@ pub struct K8sServiceDiscovery {
     client: Client,
     config: KubernetesSdConfig,
     targets: Arc<RwLock<Vec<DiscoveredTarget>>>,
-    pub metadata_cache: Arc<RwLock<MetadataCache>>,  // ✅ 改为 pub，供 scrape 使用
+    
+    // ✅ 改为使用全局缓存
+    pub metadata_cache: Arc<RwLock<MetadataCache>>,
+    
+    // ✅ 保存 Watch Guard（RAII 自动注销）
+    _namespace_guards: Vec<NamespaceWatchGuard>,
+    _node_guard: Option<NodeWatchGuard>,
+    
+    // ✅ 只需要 shutdown_tx 来停止 Endpoints/Node 发现的 Watch
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
@@ -216,6 +224,8 @@ impl Clone for K8sServiceDiscovery {
             targets: Arc::clone(&self.targets),
             metadata_cache: Arc::clone(&self.metadata_cache),
             shutdown_tx: Arc::clone(&self.shutdown_tx),
+            _namespace_guards: self._namespace_guards.clone(),
+            _node_guard: self._node_guard.clone(),
         }
     }
 }
@@ -224,33 +234,51 @@ impl K8sServiceDiscovery {
     pub async fn new(config: KubernetesSdConfig) -> Result<Self> {
         let client = Client::try_default().await?;
         let targets = Arc::new(RwLock::new(Vec::new()));
-        let metadata_cache = Arc::new(RwLock::new(MetadataCache::new()));
+        
+        // ✅ 使用全局缓存
+        let metadata_cache = get_watch_manager().get_cache(); 
+        
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        
+        // ✅ 注册 namespace 和 node watch
+        let mut namespace_guards = Vec::new();
+        for namespace in &config.namespaces {
+            let guard = NamespaceWatchGuard::new(namespace.clone()).await?;
+            namespace_guards.push(guard);
+        }
+        
+        // ✅ 根据 role 决定是否需要 Node Watch，当前都需要
+        let node_guard = match config.role {
+            KubernetesRole::Node => Some(NodeWatchGuard::new().await?),
+            KubernetesRole::Endpoints => {
+                // endpoints 角色也需要 Node Watch（获取 Pod 所在节点的元数据）
+                Some(NodeWatchGuard::new().await?)
+            }
+        };
         
         let discovery = Self {
             client,
             config,
             targets,
             metadata_cache,
+            _namespace_guards: namespace_guards,
+            _node_guard: node_guard,
             shutdown_tx: Arc::new(shutdown_tx),
         };
         
+        // ✅ 初始发现
         let initial_targets = discovery.discover_targets_internal().await?;
         *discovery.targets.write().await = initial_targets;
         
+        // ✅ 启动 Endpoints/Node 发现的 Watch（这些仍然是每个 source 独立的）
         match discovery.config.role {
             KubernetesRole::Endpoints => {
                 discovery.start_endpoints_watch_task();
-                discovery.start_pod_watch_task();
-                discovery.start_service_watch_task();
             }
             KubernetesRole::Node => {
                 discovery.start_nodes_watch_task();
             }
         }
-        
-        discovery.start_node_watch_task();
-        discovery.start_cache_stats_task();
         
         Ok(discovery)
     }
@@ -259,208 +287,6 @@ impl K8sServiceDiscovery {
         self.targets.read().await.clone()
     }
     
-    fn start_pod_watch_task(&self) {
-        let cache = Arc::clone(&self.metadata_cache);
-        let client = self.client.clone();
-        let namespaces = self.config.namespaces.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    info!("Pod watch task shutting down");
-                }
-                _ = async {
-                    for namespace in &namespaces {
-                        let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-                        let mut stream = Box::pin(
-                            watcher(pods_api, Default::default()).applied_objects()
-                        );
-                        
-                        while let Some(pod_result) = stream.next().await {
-                            match pod_result {
-                                Ok(pod) => {
-                                    let pod_name = pod.metadata.name.clone().unwrap_or_default();
-                                    let new_labels = pod.metadata.labels.unwrap_or_default();
-                                    let new_annotations = pod.metadata.annotations.unwrap_or_default();
-                                    let new_pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.clone());
-                                    
-                                    // ✅ 检查是否真的变化了
-                                    let mut cache_guard = cache.write().await;
-                                    let should_update = if let Some(existing) = cache_guard.get_pod_cached(namespace, &pod_name) {
-                                        existing.labels != new_labels 
-                                            || existing.annotations != new_annotations
-                                            || existing.pod_ip != new_pod_ip
-                                    } else {
-                                        true
-                                    };
-                                    
-                                    if should_update {
-                                        let metadata = Arc::new(PodMetadata {
-                                            name: pod.metadata.name.unwrap_or_default(),
-                                            namespace: pod.metadata.namespace.unwrap_or_default(),
-                                            labels: new_labels,
-                                            annotations: new_annotations,
-                                            pod_ip: new_pod_ip,
-                                        });
-                                        
-                                        cache_guard.update_pod(namespace, &pod_name, metadata);
-                                        info!("Updated cache for pod {}/{} (metadata changed)", namespace, pod_name);
-                                    }
-                                    drop(cache_guard);
-                                }
-                                Err(e) => {
-                                    warn!("Pod watch error: {:?}", e);
-                                }
-                            }
-                        }
-                    }
-                } => {}
-            }
-        });
-    }
-
-    fn start_node_watch_task(&self) {
-        let cache = Arc::clone(&self.metadata_cache);
-        let client = self.client.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    info!("Node watch task shutting down");
-                }
-                _ = async {
-                    let nodes_api: Api<Node> = Api::all(client.clone());
-                    let mut stream = Box::pin(
-                        watcher(nodes_api, Default::default()).applied_objects()
-                    );
-                    
-                    while let Some(node_result) = stream.next().await {
-                        match node_result {
-                            Ok(node) => {
-                                let node_name = node.metadata.name.clone().unwrap_or_default();
-                                
-                                let node_ip = if let Some(status) = &node.status {
-                                    if let Some(addresses) = &status.addresses {
-                                        addresses.iter()
-                                            .find(|addr| addr.type_ == "InternalIP")
-                                            .or_else(|| addresses.first())
-                                            .map(|addr| addr.address.clone())
-                                    } else { None }
-                                } else { None };
-                                
-                                let new_labels = node.metadata.labels.unwrap_or_default();
-                                
-                                // ✅ 检查是否真的变化了
-                                let mut cache_guard = cache.write().await;
-                                let should_update = if let Some(existing) = cache_guard.get_node_cached(&node_name) {
-                                    // 比较标签和 IP 是否变化
-                                    existing.labels != new_labels || existing.node_ip != node_ip
-                                } else {
-                                    // 缓存中没有，需要添加
-                                    true
-                                };
-                                
-                                if should_update {
-                                    let metadata = Arc::new(NodeMetadata {
-                                        name: node_name.clone(),
-                                        labels: new_labels,
-                                        node_ip,
-                                    });
-                                    
-                                    cache_guard.update_node(&node_name, metadata);
-                                    info!("Updated cache for node {} (metadata changed)", node_name);
-                                }
-                                drop(cache_guard);
-                            }
-                            Err(e) => {
-                                warn!("Node watch error: {:?}", e);
-                            }
-                        }
-                    }
-                } => {}
-            }
-        });
-    }
-
-    fn start_service_watch_task(&self) {
-        let cache = Arc::clone(&self.metadata_cache);
-        let client = self.client.clone();
-        let namespaces = self.config.namespaces.clone();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    info!("Service watch task shutting down");
-                }
-                _ = async {
-                    for namespace in &namespaces {
-                        let services_api: Api<Service> = Api::namespaced(client.clone(), namespace);
-                        let mut stream = Box::pin(
-                            watcher(services_api, Default::default()).applied_objects()
-                        );
-                        
-                        while let Some(service_result) = stream.next().await {
-                            match service_result {
-                                Ok(service) => {
-                                    let service_name = service.metadata.name.clone().unwrap_or_default();
-                                    let new_labels = service.metadata.labels.unwrap_or_default();
-                                    let new_annotations = service.metadata.annotations.unwrap_or_default();
-                                    
-                                    // ✅ 检查是否真的变化了
-                                    let mut cache_guard = cache.write().await;
-                                    let should_update = if let Some(existing) = cache_guard.get_service_cached(namespace, &service_name) {
-                                        existing.labels != new_labels || existing.annotations != new_annotations
-                                    } else {
-                                        true
-                                    };
-                                    
-                                    if should_update {
-                                        let metadata = Arc::new(ServiceMetadata {
-                                            name: service.metadata.name.unwrap_or_default(),
-                                            namespace: service.metadata.namespace.unwrap_or_default(),
-                                            labels: new_labels,
-                                            annotations: new_annotations,
-                                        });
-                                        
-                                        cache_guard.update_service(namespace, &service_name, metadata);
-                                        info!("Updated cache for service {}/{} (metadata changed)", namespace, service_name);
-                                    }
-                                    drop(cache_guard);
-                                }
-                                Err(e) => {
-                                    warn!("Service watch error: {:?}", e);
-                                }
-                            }
-                        }
-                    }
-                } => {}
-            }
-        });
-    }
-
-    fn start_cache_stats_task(&self) {
-        let cache = Arc::clone(&self.metadata_cache);
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.changed() => break,
-                    _ = interval.tick() => {
-                        let cache_guard = cache.read().await;
-                        let stats = cache_guard.stats();
-                        drop(cache_guard);
-                        info!("Metadata cache stats: pods={}, nodes={}, services={}",
-                              stats.pods_count, stats.nodes_count, stats.services_count);
-                    }
-                }
-            }
-        });
-    }
     
     async fn discover_targets_internal(&self) -> Result<Vec<DiscoveredTarget>> {
         match self.config.role {
@@ -817,7 +643,7 @@ impl K8sServiceDiscovery {
             None => return Ok(targets),
         };
         
-        let node_ip = if let Some(status) = &node.status {
+        let host_ip = if let Some(status) = &node.status {
             if let Some(addresses) = &status.addresses {
                 addresses.iter()
                     .find(|addr| addr.type_ == "InternalIP")
@@ -830,7 +656,7 @@ impl K8sServiceDiscovery {
             None
         };
         
-        let node_ip = match node_ip {
+        let host_ip = match host_ip {
             Some(ip) => ip,
             None => {
                 warn!("Node {} has no IP address", node_name);
@@ -849,7 +675,7 @@ impl K8sServiceDiscovery {
         let url = format!(
             "{}://{}:{}{}",
             self.config.scheme,
-            node_ip,
+            host_ip,
             port,
             self.config.metrics_path
         );

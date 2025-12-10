@@ -79,9 +79,9 @@ pub async fn add_metadata_to_metric(
                 }
             }
             
-            if config.node_ip {
+            if config.host_ip {
                 if let Some(ref ip) = node_meta.node_ip {
-                    let tag_name = format!("{}node_ip", config.label_prefix);
+                    let tag_name = format!("{}host_ip", config.label_prefix);
                     if !honor_labels || metric.tag_value(&tag_name).is_none() {
                         metric.replace_tag(tag_name, ip.clone());
                     }
