@@ -181,20 +181,9 @@ impl MetadataCache {
         self.pods.insert(key, metadata);
     }
 
-    /// 主动失效 Pod 缓存
-    pub fn invalidate_pod(&mut self, namespace: &str, pod_name: &str) {
-        let key = format!("{}/{}", namespace, pod_name);
-        self.pods.remove(&key);
-    }
-
     /// 主动失效并更新 Node 缓存
     pub fn update_node(&mut self, node_name: &str, metadata: Arc<NodeMetadata>) {
         self.nodes.insert(node_name.to_string(), metadata);
-    }
-
-    /// 主动失效 Node 缓存
-    pub fn invalidate_node(&mut self, node_name: &str) {
-        self.nodes.remove(node_name);
     }
 
     /// 主动失效并更新 Service 缓存
@@ -203,28 +192,40 @@ impl MetadataCache {
         self.services.insert(key, metadata);
     }
 
-    /// 主动失效 Service 缓存
-    pub fn invalidate_service(&mut self, namespace: &str, service_name: &str) {
+    // ✅ 删除单个 Pod
+    pub fn remove_pod(&mut self, namespace: &str, pod_name: &str) {
+        let key = format!("{}/{}", namespace, pod_name);
+        self.pods.remove(&key);  // ✅ 直接从 HashMap 删除
+    }
+
+    // ✅ 清理整个 namespace 的 Pod（用于 Watch 重启）
+    pub fn clear_namespace_pods(&mut self, namespace: &str) {
+        // ✅ 保留不是该 namespace 的 Pod
+        self.pods.retain(|k, _| !k.starts_with(&format!("{}/", namespace)));
+    }
+
+    // ✅ 删除单个 Service
+    pub fn remove_service(&mut self, namespace: &str, service_name: &str) {
         let key = format!("{}/{}", namespace, service_name);
         self.services.remove(&key);
     }
 
-    /// 获取缓存统计信息
-    pub fn stats(&self) -> CacheStats {
-        CacheStats {
-            pods_count: self.pods.len(),
-            nodes_count: self.nodes.len(),
-            services_count: self.services.len(),
-        }
+    // ✅ 清理整个 namespace 的 Service
+    pub fn clear_namespace_services(&mut self, namespace: &str) {
+        self.services.retain(|k, _| !k.starts_with(&format!("{}/", namespace)));
+    }
+
+    // ✅ 删除单个 Node
+    pub fn remove_node(&mut self, node_name: &str) {
+        self.nodes.remove(node_name);
+    }
+
+    // ✅ 清理所有 Node（用于 Watch 重启）
+    pub fn clear_all_nodes(&mut self) {
+        self.nodes.clear();
     }
 }
 
-#[derive(Debug)]
-pub struct CacheStats {
-    pub pods_count: usize,
-    pub nodes_count: usize,
-    pub services_count: usize,
-}
 
 // ============================================================================
 // 辅助函数：从 Pod 获取 Node 名称
