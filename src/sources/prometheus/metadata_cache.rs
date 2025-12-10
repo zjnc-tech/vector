@@ -198,11 +198,11 @@ impl MetadataCache {
         self.pods.remove(&key);  // ✅ 直接从 HashMap 删除
     }
 
-    // ✅ 清理整个 namespace 的 Pod（用于 Watch 重启）
-    pub fn clear_namespace_pods(&mut self, namespace: &str) {
-        // ✅ 保留不是该 namespace 的 Pod
-        self.pods.retain(|k, _| !k.starts_with(&format!("{}/", namespace)));
-    }
+    // // ✅ 清理整个 namespace 的 Pod（用于 Watch 重启）
+    // pub fn clear_namespace_pods(&mut self, namespace: &str) {
+    //     // ✅ 保留不是该 namespace 的 Pod
+    //     self.pods.retain(|k, _| !k.starts_with(&format!("{}/", namespace)));
+    // }
 
     // ✅ 删除单个 Service
     pub fn remove_service(&mut self, namespace: &str, service_name: &str) {
@@ -210,20 +210,20 @@ impl MetadataCache {
         self.services.remove(&key);
     }
 
-    // ✅ 清理整个 namespace 的 Service
-    pub fn clear_namespace_services(&mut self, namespace: &str) {
-        self.services.retain(|k, _| !k.starts_with(&format!("{}/", namespace)));
-    }
+    // // ✅ 清理整个 namespace 的 Service
+    // pub fn clear_namespace_services(&mut self, namespace: &str) {
+    //     self.services.retain(|k, _| !k.starts_with(&format!("{}/", namespace)));
+    // }
 
     // ✅ 删除单个 Node
     pub fn remove_node(&mut self, node_name: &str) {
         self.nodes.remove(node_name);
     }
 
-    // ✅ 清理所有 Node（用于 Watch 重启）
-    pub fn clear_all_nodes(&mut self) {
-        self.nodes.clear();
-    }
+    // // ✅ 清理所有 Node（用于 Watch 重启）
+    // pub fn clear_all_nodes(&mut self) {
+    //     self.nodes.clear();
+    // }
 }
 
 
