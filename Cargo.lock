@@ -11686,6 +11686,7 @@ dependencies = [
  "notify",
  "num-format",
  "number_prefix",
+ "once_cell",
  "opendal",
  "openssl",
  "openssl-probe",

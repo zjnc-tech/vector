@@ -382,7 +382,7 @@ rand.workspace = true
 rand_distr.workspace = true
 rdkafka = { version = "0.37.0", default-features = false, features = ["curl-static", "tokio", "libz", "ssl", "zstd"], optional = true }
 redis = { version = "0.24.0", default-features = false, features = ["connection-manager", "tokio-comp", "tokio-native-tls-comp"], optional = true }
-regex = { version = "1.11.1", default-features = false, features = ["std", "perf"] }
+regex = { version = "1.11.1", default-features = false, features = ["std", "perf"], optional = true }
 roaring = { version = "0.10.10", default-features = false, features = ["std"], optional = true }
 rumqttc = { version = "0.24.0", default-features = false, features = ["use-rustls"], optional = true }
 seahash = { version = "4.1.0", default-features = false }
@@ -416,6 +416,7 @@ sysinfo = "0.34.2"
 byteorder = "1.5.0"
 time = "0.3.36"
 phf = { version = "0.11", features = ["macros"] }
+once_cell = { version = "1.20.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7.0"
@@ -620,6 +621,7 @@ sources-metrics = [
   "sources-statsd",
   "sources-vector",
   "sources-lldp",
+  "sources-snmp",
   "sources-dcgm",
   "sources-pci"
 ]
@@ -654,6 +656,7 @@ sources-logstash = ["sources-utils-net-tcp", "tokio-util/net"]
 sources-lldp = []
 sources-dcgm = ["dep:prost", "dep:tonic", "protobuf-build"]
 sources-pci = []
+sources-snmp = ["regex", "once_cell"]
 sources-mongodb_metrics = ["dep:mongodb"]
 sources-nats = ["dep:async-nats", "dep:nkeys"]
 sources-nginx_metrics = ["dep:nom"]
