@@ -416,6 +416,7 @@ sysinfo = "0.34.2"
 byteorder = "1.5.0"
 time = "0.3.36"
 phf = { version = "0.11", features = ["macros"] }
+once_cell = "1.20.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7.0"
