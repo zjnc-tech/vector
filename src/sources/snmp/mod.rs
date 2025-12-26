@@ -7,6 +7,7 @@ use chrono::Utc;
 use std::time::Duration;
 use std::collections::HashMap;
 use regex::Regex;
+use tracing::{debug, warn};
 
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
@@ -186,27 +187,49 @@ async fn snmpwalk_fill<F>(
 where
     F: FnMut(String, String),
 {
+    let cmd_args = [
+        "-v3", "-l", "AuthNoPriv",
+        "-u", user,
+        "-a", auth_protocol,
+        "-A", auth_password,
+        target,
+        oid,
+    ];
+
+    debug!("Executing snmpwalk command: snmpwalk {}", cmd_args.join(" "));
+
     let out = tokio::process::Command::new("snmpwalk")
-        .args([
-            "-v3", "-l", "AuthNoPriv",
-            "-u", user,
-            "-a", auth_protocol,
-            "-A", auth_password,
-            target,
-            oid,
-        ])
+        .args(&cmd_args)
         .output()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let err_msg = e.to_string();
+            debug!("snmpwalk command failed: {}", err_msg);
+            err_msg
+        })?;
 
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some((oid, val)) = line.split_once(" = STRING: ") {
-            let idx = extract_lldp_index(oid)?;
-            f(idx, val.trim_matches('"').to_string());
+    let output = String::from_utf8_lossy(&out.stdout);
+    debug!("snmpwalk output (first 500 chars): {}", output.chars().take(500).collect::<String>().replace("\n", " "));
+
+    if !out.stderr.is_empty() {
+        let stderr_str = String::from_utf8_lossy(&out.stderr);
+        debug!("snmpwalk stderr: {}", stderr_str);
+    }
+
+    let mut count = 0;
+    for line in output.lines() {
+        if let Some((oid_part, val)) = line.split_once(" = STRING: ") {
+            let idx = extract_lldp_index(oid_part)?;
+            let value = val.trim_matches('"').to_string();
+            debug!("Parsed LLDP entry - index: {}, value: {}", idx, value);
+            f(idx, value);
+            count += 1;
         }
     }
+    debug!("Parsed {} LLDP entries from output", count);
     Ok(())
 }
+
 
 
 fn extract_port_from_desc(desc: &str) -> String {
@@ -240,26 +263,42 @@ async fn get_local_device(
     auth_protocol: &str,
     auth_password: &str,
 ) -> Result<String, String> {
+    let cmd_args = [
+        "-v3", "-l", "AuthNoPriv",
+        "-u", user,
+        "-a", auth_protocol,
+        "-A", auth_password,
+        target,
+        "1.3.6.1.2.1.1.5.0",
+    ];
+    
+    debug!("Executing snmpget command: snmpget {}", cmd_args.join(" "));
+    
     let out = tokio::process::Command::new("snmpget")
-        .args([
-            "-v3", "-l", "AuthNoPriv",
-            "-u", user,
-            "-a", auth_protocol,
-            "-A", auth_password,
-            target,
-            "1.3.6.1.2.1.1.5.0",
-        ])
+        .args(&cmd_args)
         .output()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let err_msg = e.to_string();
+            debug!("snmpget command failed: {}", err_msg);
+            err_msg
+        })?;
 
     let s = String::from_utf8_lossy(&out.stdout);
+    debug!("snmpget output: {}", s);
+    
+    if !out.stderr.is_empty() {
+        let stderr_str = String::from_utf8_lossy(&out.stderr);
+        debug!("snmpget stderr: {}", stderr_str);
+    }
+    
     let output = s.trim();
     
     // 尝试解析 "= STRING:" 格式，例如: "iso.3.6.1.2.1.1.5.0 = STRING: \"value\""
     if let Some(pos) = output.find("= STRING:") {
         let value_part = &output[pos + 9..]; // 9 is the length of "= STRING:"
         let trimmed = value_part.trim();
+        debug!("Found = STRING: format, extracted value: {}", trimmed);
         
         // 检查是否有引号包围
         if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
@@ -273,6 +312,7 @@ async fn get_local_device(
     if let Some(pos) = output.find("STRING:") {
         let value_part = &output[pos + 7..]; // 7 is the length of "STRING:"
         let trimmed = value_part.trim();
+        debug!("Found STRING: format, extracted value: {}", trimmed);
         
         // 检查是否有引号包围
         if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
@@ -282,6 +322,7 @@ async fn get_local_device(
         }
     }
     
+    debug!("Failed to parse sysName from output: {}", output);
     // 如果以上都失败，返回错误
     Err("parse sysName failed".into())
 }
