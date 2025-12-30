@@ -4,9 +4,9 @@
 //! to build a topology of nodes, leaf switches, and spine switches.
 
 use chrono::Utc;
-use std::time::Duration;
-use std::collections::HashMap;
 use regex::Regex;
+use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
@@ -15,10 +15,7 @@ use crate::{
 use vector_lib::configurable::configurable_component;
 
 /// Configuration for the `snmp` source.
-#[configurable_component(source(
-    "snmp",
-    "Collect LLDP neighbors from switches via SNMP"
-))]
+#[configurable_component(source("snmp", "Collect LLDP neighbors from switches via SNMP"))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SnmpSwitchLldpConfig {
@@ -73,8 +70,7 @@ impl SourceConfig for SnmpSwitchLldpConfig {
         let auth_password = self.auth_password.clone();
 
         Ok(Box::pin(async move {
-            let mut ticker =
-                tokio::time::interval(Duration::from_secs(interval));
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
 
             loop {
                 tokio::select! {
@@ -129,51 +125,61 @@ async fn collect_lldp_from_switch(
     auth_protocol: &str,
     auth_password: &str,
 ) -> Result<Vec<LldpNeighbor>, String> {
-
-    let local_device = get_local_device(
-        target, user, auth_protocol, auth_password
-    ).await?;
+    let local_device = get_local_device(target, user, auth_protocol, auth_password).await?;
 
     let mut neighbors: std::collections::HashMap<String, PartialNeighbor> =
         std::collections::HashMap::new();
 
     // local_port
     snmpwalk_fill(
-        target, user, auth_protocol, auth_password,
+        target,
+        user,
+        auth_protocol,
+        auth_password,
         "1.0.8802.1.1.2.1.3.7.1.4",
         |idx, val| {
-            neighbors.entry(idx).or_default().local_port = Some(
-                extract_port_from_desc(&val)
-            );
+            neighbors.entry(idx).or_default().local_port = Some(extract_port_from_desc(&val));
         },
-    ).await?;
+    )
+    .await?;
 
     // remote_device
     snmpwalk_fill(
-        target, user, auth_protocol, auth_password,
+        target,
+        user,
+        auth_protocol,
+        auth_password,
         LLDP_REM_SYS_NAME,
         |idx, val| {
             neighbors.entry(idx).or_default().remote_device = Some(val);
         },
-    ).await?;
+    )
+    .await?;
 
     // remote_port
     snmpwalk_fill(
-        target, user, auth_protocol, auth_password,
+        target,
+        user,
+        auth_protocol,
+        auth_password,
         LLDP_REM_PORT_ID,
         |idx, val| {
             neighbors.entry(idx).or_default().remote_port = Some(val);
         },
-    ).await?;
+    )
+    .await?;
 
-    Ok(neighbors.into_iter().filter_map(|(_, n)| {
-        Some(LldpNeighbor {
-            local_device: local_device.clone(),
-            local_port: n.local_port?,
-            remote_device: n.remote_device?,
-            remote_port: n.remote_port?,
+    Ok(neighbors
+        .into_iter()
+        .filter_map(|(_, n)| {
+            Some(LldpNeighbor {
+                local_device: local_device.clone(),
+                local_port: n.local_port?,
+                remote_device: n.remote_device?,
+                remote_port: n.remote_port?,
+            })
         })
-    }).collect())
+        .collect())
 }
 
 async fn snmpwalk_fill<F>(
@@ -189,10 +195,15 @@ where
 {
     let out = tokio::process::Command::new("snmpwalk")
         .args([
-            "-v3", "-l", "AuthNoPriv",
-            "-u", user,
-            "-a", auth_protocol,
-            "-A", auth_password,
+            "-v3",
+            "-l",
+            "AuthNoPriv",
+            "-u",
+            user,
+            "-a",
+            auth_protocol,
+            "-A",
+            auth_password,
             target,
             oid,
         ])
@@ -209,12 +220,9 @@ where
     Ok(())
 }
 
-
 fn extract_port_from_desc(desc: &str) -> String {
     static PORT_RE: once_cell::sync::Lazy<Regex> =
-        once_cell::sync::Lazy::new(|| {
-            Regex::new(r"^([A-Za-z]+[A-Za-z0-9/]+)").unwrap()
-        });
+        once_cell::sync::Lazy::new(|| Regex::new(r"^([A-Za-z]+[A-Za-z0-9/]+)").unwrap());
 
     let s = desc.trim().trim_matches('"');
 
@@ -230,7 +238,7 @@ fn extract_lldp_index(oid: &str) -> Result<String, String> {
     if parts.len() < 3 {
         return Err("bad oid".into());
     }
-    Ok(parts[parts.len()-3..].join("."))
+    Ok(parts[parts.len() - 3..].join("."))
 }
 
 async fn get_local_device(
@@ -241,10 +249,15 @@ async fn get_local_device(
 ) -> Result<String, String> {
     let out = tokio::process::Command::new("snmpget")
         .args([
-            "-v3", "-l", "AuthNoPriv",
-            "-u", user,
-            "-a", auth_protocol,
-            "-A", auth_password,
+            "-v3",
+            "-l",
+            "AuthNoPriv",
+            "-u",
+            user,
+            "-a",
+            auth_protocol,
+            "-A",
+            auth_password,
             target,
             "1.3.6.1.2.1.1.5.0",
         ])
@@ -259,10 +272,7 @@ async fn get_local_device(
         .ok_or("parse sysName failed".into())
 }
 
-fn neighbors_to_metrics(
-    target: &str,
-    neighbors: Vec<LldpNeighbor>,
-) -> Vec<Metric> {
+fn neighbors_to_metrics(target: &str, neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
     let ts = Utc::now();
 
     neighbors
@@ -281,8 +291,8 @@ fn neighbors_to_metrics(
                 MetricKind::Absolute,
                 MetricValue::Gauge { value: 1.0 },
             )
-                .with_tags(Some(tags))
-                .with_timestamp(Some(ts))
+            .with_tags(Some(tags))
+            .with_timestamp(Some(ts))
         })
         .collect()
 }

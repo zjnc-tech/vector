@@ -54,7 +54,10 @@ impl ClickhouseMetricsSink {
 
         let service = ClickhouseService::new(self.client);
 
-        let svc = ServiceBuilder::new().concurrency_limit(4).buffer(1024).service(service);
+        let svc = ServiceBuilder::new()
+            .concurrency_limit(4)
+            .buffer(1024)
+            .service(service);
 
         input
             .batched_partitioned(KeyPartitioner::new(self.database, self.table), || {
