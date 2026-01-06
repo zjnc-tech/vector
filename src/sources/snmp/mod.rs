@@ -4,9 +4,10 @@
 //! to build a topology of nodes, leaf switches, and spine switches.
 
 use chrono::Utc;
-use regex::Regex;
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
+
+// use regex::Regex;
+use tracing::{info, warn};
 
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
@@ -14,8 +15,11 @@ use crate::{
 };
 use vector_lib::configurable::configurable_component;
 
-/// Configuration for the `snmp` source.
-#[configurable_component(source("snmp", "Collect LLDP neighbors from switches via SNMP"))]
+/// Configuration for the `snmp_switch_lldp` source.
+#[configurable_component(source(
+    "snmp",
+    "Collect LLDP neighbors from switches via SNMP"
+))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SnmpSwitchLldpConfig {
@@ -47,8 +51,10 @@ struct LldpNeighbor {
     remote_device: String,
     remote_port: String,
 }
+
 #[derive(Debug, Clone, Default)]
 struct PartialNeighbor {
+    local_device: Option<String>,
     local_port: Option<String>,
     remote_device: Option<String>,
     remote_port: Option<String>,
@@ -83,7 +89,7 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                                 &auth_password,
                             ).await {
                                 Ok(neighbors) => {
-                                    let metrics = neighbors_to_metrics(target, neighbors);
+                                    let metrics = neighbors_to_metrics(neighbors);
                                     if out.send_batch(metrics).await.is_err() {
                                         warn!("failed to send LLDP metrics");
                                     }
@@ -115,9 +121,10 @@ impl SourceConfig for SnmpSwitchLldpConfig {
     }
 }
 
-const LLDP_REM_SYS_NAME: &str = "1.0.8802.1.1.2.1.4.1.1.9";
-const LLDP_REM_PORT_ID: &str = "1.0.8802.1.1.2.1.4.1.1.7";
-const LLDP_REM_CHASSIS_ID: &str = "1.0.8802.1.1.2.1.4.1.1.5";
+// LLDP OIDs aligned with Go logic
+const LLDP_LOCAL_SYS_PORT: &str = "1.0.8802.1.1.2.1.4.1.1.8";
+const LLDP_REM_SYS_NAME:  &str = "1.0.8802.1.1.2.1.4.1.1.9";
+const LLDP_REM_PORT_ID:   &str = "1.0.8802.1.1.2.1.4.1.1.7";
 
 async fn collect_lldp_from_switch(
     target: &str,
@@ -125,25 +132,30 @@ async fn collect_lldp_from_switch(
     auth_protocol: &str,
     auth_password: &str,
 ) -> Result<Vec<LldpNeighbor>, String> {
-    let local_device = get_local_device(target, user, auth_protocol, auth_password).await?;
+    // warn!("get local_device");
+    // let local_device = get_local_device(target, user, auth_protocol, auth_password).await?;
 
-    let mut neighbors: std::collections::HashMap<String, PartialNeighbor> =
-        std::collections::HashMap::new();
+    let mut neighbors: HashMap<String, PartialNeighbor> = HashMap::new();
 
-    // local_port
+    warn!("get neighbors");
+    // local system port
     snmpwalk_fill(
         target,
         user,
         auth_protocol,
         auth_password,
-        "1.0.8802.1.1.2.1.3.7.1.4",
+        LLDP_LOCAL_SYS_PORT,
         |idx, val| {
-            neighbors.entry(idx).or_default().local_port = Some(extract_port_from_desc(&val));
+            if let Ok((dev, port)) = split_local_sys_port(&val) {
+                let entry = neighbors.entry(idx).or_default();
+                entry.local_device = Some(dev);
+                entry.local_port = Some(port);
+            }
         },
     )
-    .await?;
+        .await?;
 
-    // remote_device
+    // remote system name
     snmpwalk_fill(
         target,
         user,
@@ -154,9 +166,9 @@ async fn collect_lldp_from_switch(
             neighbors.entry(idx).or_default().remote_device = Some(val);
         },
     )
-    .await?;
+        .await?;
 
-    // remote_port
+    // remote port id
     snmpwalk_fill(
         target,
         user,
@@ -167,13 +179,21 @@ async fn collect_lldp_from_switch(
             neighbors.entry(idx).or_default().remote_port = Some(val);
         },
     )
-    .await?;
+        .await?;
 
     Ok(neighbors
-        .into_iter()
-        .filter_map(|(_, n)| {
+        .into_values()
+        .filter_map(|n| {
+            // filter RemoteSystemName contains Spine
+            // if let Some(ref remote) = n.remote_device {
+            //     if !remote.contains("Spine") && !remote.contains("spine") {
+            //         return None;
+            //     }
+            // } else {
+            //     return None;
+            // }
             Some(LldpNeighbor {
-                local_device: local_device.clone(),
+                local_device: n.local_device?,
                 local_port: n.local_port?,
                 remote_device: n.remote_device?,
                 remote_port: n.remote_port?,
@@ -187,117 +207,153 @@ async fn snmpwalk_fill<F>(
     user: &str,
     auth_protocol: &str,
     auth_password: &str,
-    oid: &str,
+    base_oid: &str,
     mut f: F,
 ) -> Result<(), String>
 where
     F: FnMut(String, String),
 {
+    let cmd_args = [
+        "-v3",
+        "-l",
+        "AuthNoPriv",
+        "-u",
+        user,
+        "-a",
+        auth_protocol,
+        "-A",
+        auth_password,
+        target,
+        base_oid,
+    ];
+
+    warn!("Executing snmpwalk: snmpwalk {}", cmd_args.join(" "));
+
     let out = tokio::process::Command::new("snmpwalk")
-        .args([
-            "-v3",
-            "-l",
-            "AuthNoPriv",
-            "-u",
-            user,
-            "-a",
-            auth_protocol,
-            "-A",
-            auth_password,
-            target,
-            oid,
-        ])
+        .args(&cmd_args)
         .output()
         .await
         .map_err(|e| e.to_string())?;
 
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some((oid, val)) = line.split_once(" = STRING: ") {
-            let idx = extract_lldp_index(oid)?;
-            f(idx, val.trim_matches('"').to_string());
+    if !out.stderr.is_empty() {
+        warn!("snmpwalk stderr: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let output = String::from_utf8_lossy(&out.stdout);
+    let mut count = 0;
+
+    for line in output.lines() {
+        if let Some((oid_part, val)) = line.split_once(" = ") {
+            let idx = extract_lldp_index(oid_part, base_oid)?;
+            let value = val
+                .trim_start_matches("STRING:")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            f(idx, value);
+            count += 1;
         }
     }
+
+    warn!("Parsed {} entries for base_oid {}", count, base_oid);
     Ok(())
 }
 
-fn extract_port_from_desc(desc: &str) -> String {
-    static PORT_RE: once_cell::sync::Lazy<Regex> =
-        once_cell::sync::Lazy::new(|| Regex::new(r"^([A-Za-z]+[A-Za-z0-9/]+)").unwrap());
+fn split_local_sys_port(val: &str) -> Result<(String, String), String> {
+    let s = val.trim().trim_matches('"');
+    let mut parts = s.split('_');
+    let dev = parts
+        .next()
+        .ok_or_else(|| format!("invalid local sys/port value: {}", s))?;
+    let port = parts
+        .next()
+        .ok_or_else(|| format!("invalid local sys/port value: {}", s))?;
+    Ok((dev.to_string(), port.to_string()))
+}
 
-    let s = desc.trim().trim_matches('"');
+fn extract_lldp_index(oid: &str, base_oid: &str) -> Result<String, String> {
+    let oid = normalize_oid(oid);
+    if !oid.starts_with(base_oid) {
+        return Err(format!("oid {} does not start with base {}", oid, base_oid));
+    }
+    Ok(oid[base_oid.len()..].trim_start_matches('.').to_string())
+}
 
-    if let Some(cap) = PORT_RE.captures(s) {
-        cap.get(1).unwrap().as_str().to_string()
+fn normalize_oid(oid: &str) -> String {
+    if let Some(rest) = oid.strip_prefix("iso.") {
+        format!("1.{}", rest)
     } else {
-        s.to_string()
+        oid.to_string()
     }
 }
 
-fn extract_lldp_index(oid: &str) -> Result<String, String> {
-    let parts: Vec<&str> = oid.split('.').collect();
-    if parts.len() < 3 {
-        return Err("bad oid".into());
-    }
-    Ok(parts[parts.len() - 3..].join("."))
-}
+// async fn get_local_device(
+//     target: &str,
+//     user: &str,
+//     auth_protocol: &str,
+//     auth_password: &str,
+// ) -> Result<String, String> {
+//     let cmd_args = [
+//         "-v3",
+//         "-l",
+//         "AuthNoPriv",
+//         "-u",
+//         user,
+//         "-a",
+//         auth_protocol,
+//         "-A",
+//         auth_password,
+//         target,
+//         "1.3.6.1.2.1.1.5.0",
+//     ];
+//
+//     warn!("Executing snmpget: snmpget {}", cmd_args.join(" "));
+//
+//     let out = tokio::process::Command::new("snmpget")
+//         .args(&cmd_args)
+//         .output()
+//         .await
+//         .map_err(|e| e.to_string())?;
+//
+//     if !out.stderr.is_empty() {
+//         warn!("snmpget stderr: {}", String::from_utf8_lossy(&out.stderr));
+//     }
+//
+//     let output = String::from_utf8_lossy(&out.stdout);
+//
+//     if let Some(pos) = output.find("STRING:") {
+//         let v = output[pos + 7..].trim().trim_matches('"');
+//         return Ok(v.to_string());
+//     }
+//
+//     Err(format!("failed to parse sysName from output: {}", output))
+// }
 
-async fn get_local_device(
-    target: &str,
-    user: &str,
-    auth_protocol: &str,
-    auth_password: &str,
-) -> Result<String, String> {
-    let out = tokio::process::Command::new("snmpget")
-        .args([
-            "-v3",
-            "-l",
-            "AuthNoPriv",
-            "-u",
-            user,
-            "-a",
-            auth_protocol,
-            "-A",
-            auth_password,
-            target,
-            "1.3.6.1.2.1.1.5.0",
-        ])
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.split("STRING:")
-        .nth(1)
-        .map(|v| v.trim().trim_matches('"').to_string())
-        .ok_or("parse sysName failed".into())
-}
-
-fn neighbors_to_metrics(target: &str, neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
+fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
     let ts = Utc::now();
 
     neighbors
         .into_iter()
         .map(|n| {
             let mut tags = MetricTags::default();
-
-            tags.insert("local_device".into(), n.local_device.into());
-            tags.insert("local_port".into(), n.local_port.into());
-            tags.insert("remote_device".into(), n.remote_device.into());
-            tags.insert("remote_port".into(), n.remote_port.into());
-            tags.insert("protocol".into(), "lldp".into());
+            tags.insert("local_device".into(), n.local_device);
+            tags.insert("local_port".into(), n.local_port);
+            tags.insert("remote_device".into(), n.remote_device);
+            tags.insert("remote_port".into(), n.remote_port);
+            tags.insert("source".into(), "snmp");
+            tags.insert("protocol".into(), "lldp");
 
             Metric::new(
-                "snmp_lldp_link",
+                "lldp_link",
                 MetricKind::Absolute,
                 MetricValue::Gauge { value: 1.0 },
             )
-            .with_tags(Some(tags))
-            .with_timestamp(Some(ts))
+                .with_tags(Some(tags))
+                .with_timestamp(Some(ts))
         })
         .collect()
 }
 
-// Default implementation for config generation
 impl Default for SnmpSwitchLldpConfig {
     fn default() -> Self {
         Self {
