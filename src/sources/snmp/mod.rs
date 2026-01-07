@@ -79,7 +79,7 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                         }
                     }
                     _ = shutdown.clone() => {
-                        error!("snmp_switch_lldp source shutdown");
+                        info!("snmp_switch_lldp source shutdown");
                         break;
                     }
                 }
@@ -97,7 +97,6 @@ impl SourceConfig for SnmpSwitchLldpConfig {
 
 // ----------------- OIDs -----------------
 const SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
-// const IF_NAME: &str = "1.3.6.1.2.1.31.1.1.1.1";
 const LLDP_LOC_PORT_ID: &str = "1.0.8802.1.1.2.1.3.7.1.3";
 const LLDP_REM_SYS_NAME: &str = "1.0.8802.1.1.2.1.4.1.1.9";
 const LLDP_REM_PORT_ID: &str = "1.0.8802.1.1.2.1.4.1.1.7";
@@ -109,7 +108,7 @@ async fn collect_lldp_from_switch(
     auth_protocol: &str,
     auth_password: &str,
 ) -> Result<Vec<LldpNeighbor>, String> {
-    error!("Starting LLDP scrape for {}", target);
+    debug!("Starting LLDP scrape for {}", target);
 
     // 1. local device name
     let local_device = snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
@@ -124,17 +123,17 @@ async fn collect_lldp_from_switch(
     let rem_port =
         snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_PORT_ID).await?;
 
-    error!("local_device: {}", local_device);
-    error!("lldp_loc_ports: {:?}", lldp_loc_ports);
-    error!("rem_sys: {:?}", rem_sys);
-    error!("rem_port: {:?}", rem_port);
+    debug!("local_device: {}", local_device);
+    debug!("lldp_loc_ports: {:?}", lldp_loc_ports);
+    debug!("rem_sys: {:?}", rem_sys);
+    debug!("rem_port: {:?}", rem_port);
 
     let mut neighbors = Vec::new();
 
-    // 远端表里的 key 是 lldpRemTable 的索引，通常是 tuple (local_port_num, rem_index)
     for (lldp_idx, remote_device) in &rem_sys {
-        error!("Processing lldp_idx: {}", lldp_idx);
+        debug!("Processing lldp_idx: {}", lldp_idx);
 
+        // 1. remote port
         let remote_port_name = match rem_port.get(lldp_idx) {
             Some(v) => v.clone(),
             None => {
@@ -143,17 +142,17 @@ async fn collect_lldp_from_switch(
             }
         };
 
-        // 解析 lldp_idx，提取本地端口号
-        let local_port_num_str = lldp_idx
-            .split('.')   // 分割 "1.3" -> ["1", "3"]
-            .next()       // 取第一个数字
-            .unwrap_or("");
+        // 2. 解析 lldp_idx，取倒数第二段作为本地端口号
+        let parts: Vec<&str> = lldp_idx.split('.').collect();
+        let local_port_num_str = match parts.get(parts.len().saturating_sub(2)) {
+            Some(v) => *v,
+            None => {
+                error!("lldp_idx {} invalid format", lldp_idx);
+                continue;
+            }
+        };
 
-        if local_port_num_str.is_empty() {
-            error!("lldp_idx {} invalid format", lldp_idx);
-            continue;
-        }
-
+        // 3. 查本地端口名
         let local_port_name = match lldp_loc_ports.get(local_port_num_str) {
             Some(v) => v.clone(),
             None => {
