@@ -1,7 +1,6 @@
 //! SNMP source for collecting LLDP topology information
 use chrono::Utc;
 use std::{collections::{HashMap, HashSet}, time::Duration};
-use tracing::{info, warn};
 
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
@@ -98,8 +97,8 @@ impl SourceConfig for SnmpSwitchLldpConfig {
 
 // ----------------- OIDs -----------------
 const SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
-const IF_NAME: &str = "1.3.6.1.2.1.31.1.1.1.1";
-const LLDP_LOC_PORT_IFINDEX: &str = "1.0.8802.1.1.2.1.3.7.1.2";
+// const IF_NAME: &str = "1.3.6.1.2.1.31.1.1.1.1";
+const LLDP_LOC_PORT_ID: &str = "1.0.8802.1.1.2.1.3.7.1.3";
 const LLDP_REM_SYS_NAME: &str = "1.0.8802.1.1.2.1.4.1.1.9";
 const LLDP_REM_PORT_ID: &str = "1.0.8802.1.1.2.1.4.1.1.7";
 
@@ -113,40 +112,50 @@ async fn collect_lldp_from_switch(
 
     error!("Starting LLDP scrape for {}", target);
 
-    let local_device = snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
-    let if_names = snmpwalk_kv(target, user, auth_protocol, auth_password, IF_NAME).await?;
-    let lldp_port_ifindex = snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_LOC_PORT_IFINDEX).await?;
-    let rem_sys = snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_SYS_NAME).await?;
-    let rem_port = snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_PORT_ID).await?;
+    // 1. local device name
+    let local_device =
+        snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
 
-    // ---- debug print ----
+    // 2. LLDP local port name（直接用）
+    let lldp_loc_ports =
+        snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_LOC_PORT_ID).await?;
+
+    // 3. remote system name
+    let rem_sys =
+        snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_SYS_NAME).await?;
+
+    // 4. remote port id
+    let rem_port =
+        snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_PORT_ID).await?;
+
     error!("local_device: {}", local_device);
-    error!("if_names: {:?}", if_names);
-    error!("lldp_port_ifindex: {:?}", lldp_port_ifindex);
+    error!("lldp_loc_ports: {:?}", lldp_loc_ports);
     error!("rem_sys: {:?}", rem_sys);
     error!("rem_port: {:?}", rem_port);
 
     let mut neighbors = Vec::new();
-    for (lldp_idx, if_index) in lldp_port_ifindex {
-        let if_name = match if_names.get(&if_index) {
+
+    // lldp_idx 是统一索引（lldpRemTable / lldpLocPortTable）
+    for (lldp_idx, local_port) in lldp_loc_ports {
+        let remote_device = match rem_sys.get(&lldp_idx) {
             Some(v) => v.clone(),
             None => {
-                error!("if_index {} not found in if_names", if_index);
+                error!("lldp_idx {} not found in rem_sys", lldp_idx);
                 continue;
             }
         };
-        let remote_device = rem_sys.get(&lldp_idx).cloned().unwrap_or_else(|| {
-            error!("lldp_idx {} not found in rem_sys", lldp_idx);
-            "<unknown>".to_string()
-        });
-        let remote_port = rem_port.get(&lldp_idx).cloned().unwrap_or_else(|| {
-            error!("lldp_idx {} not found in rem_port", lldp_idx);
-            "<unknown>".to_string()
-        });
+
+        let remote_port = match rem_port.get(&lldp_idx) {
+            Some(v) => v.clone(),
+            None => {
+                error!("lldp_idx {} not found in rem_port", lldp_idx);
+                continue;
+            }
+        };
 
         neighbors.push(LldpNeighbor {
             local_device: local_device.clone(),
-            local_port: if_name,
+            local_port,
             remote_device,
             remote_port,
         });
