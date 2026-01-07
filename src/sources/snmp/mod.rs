@@ -1,6 +1,9 @@
 //! SNMP source for collecting LLDP topology information
 use chrono::Utc;
-use std::{collections::{HashMap, HashSet}, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
@@ -29,7 +32,9 @@ pub struct SnmpSwitchLldpConfig {
     pub scrape_interval_secs: u64,
 }
 
-const fn default_interval() -> u64 { 60 }
+const fn default_interval() -> u64 {
+    60
+}
 
 #[derive(Debug, Clone)]
 struct LldpNeighbor {
@@ -92,7 +97,9 @@ impl SourceConfig for SnmpSwitchLldpConfig {
         vec![SourceOutput::new_metrics()]
     }
 
-    fn can_acknowledge(&self) -> bool { false }
+    fn can_acknowledge(&self) -> bool {
+        false
+    }
 }
 
 // ----------------- OIDs -----------------
@@ -118,8 +125,14 @@ async fn collect_lldp_from_switch(
         snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_LOC_PORT_ID).await?;
 
     // 3. LLDP remote table（index -> remote device / remote port）
-    let rem_sys =
-        snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_SYS_NAME).await?;
+    let rem_sys = snmpwalk_kv(
+        target,
+        user,
+        auth_protocol,
+        auth_password,
+        LLDP_REM_SYS_NAME,
+    )
+    .await?;
     let rem_port =
         snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_PORT_ID).await?;
 
@@ -156,7 +169,10 @@ async fn collect_lldp_from_switch(
         let local_port_name = match lldp_loc_ports.get(local_port_num_str) {
             Some(v) => v.clone(),
             None => {
-                error!("local_port_num {} not found in lldp_loc_ports", local_port_num_str);
+                error!(
+                    "local_port_num {} not found in lldp_loc_ports",
+                    local_port_num_str
+                );
                 continue;
             }
         };
@@ -173,41 +189,90 @@ async fn collect_lldp_from_switch(
 }
 
 // ----------------- SNMP Helpers -----------------
-async fn snmp_get(target: &str, user: &str, auth_protocol: &str, auth_password: &str, oid: &str) -> Result<String,String> {
+async fn snmp_get(
+    target: &str,
+    user: &str,
+    auth_protocol: &str,
+    auth_password: &str,
+    oid: &str,
+) -> Result<String, String> {
     let out = tokio::process::Command::new("snmpget")
-        .args(["-v3","-l","AuthNoPriv","-u",user,"-a",auth_protocol,"-A",auth_password,target,oid])
-        .output().await.map_err(|e| e.to_string())?;
+        .args([
+            "-v3",
+            "-l",
+            "AuthNoPriv",
+            "-u",
+            user,
+            "-a",
+            auth_protocol,
+            "-A",
+            auth_password,
+            target,
+            oid,
+        ])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
     let s = String::from_utf8_lossy(&out.stdout);
     parse_snmp_value(&s)
 }
 
-async fn snmpwalk_kv(target: &str, user: &str, auth_protocol: &str, auth_password: &str, base_oid: &str) -> Result<HashMap<String,String>,String> {
+async fn snmpwalk_kv(
+    target: &str,
+    user: &str,
+    auth_protocol: &str,
+    auth_password: &str,
+    base_oid: &str,
+) -> Result<HashMap<String, String>, String> {
     let out = tokio::process::Command::new("snmpwalk")
-        .args(["-v3","-l","AuthNoPriv","-u",user,"-a",auth_protocol,"-A",auth_password,target,base_oid])
-        .output().await.map_err(|e| e.to_string())?;
+        .args([
+            "-v3",
+            "-l",
+            "AuthNoPriv",
+            "-u",
+            user,
+            "-a",
+            auth_protocol,
+            "-A",
+            auth_password,
+            target,
+            base_oid,
+        ])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
     let s = String::from_utf8_lossy(&out.stdout);
 
     let mut map = HashMap::new();
     for line in s.lines() {
-        if let Some((oid,val)) = line.split_once(" = ") {
-            let idx = normalize_oid(oid).trim_start_matches(base_oid).trim_start_matches('.').to_string();
-            let value = val.trim_start_matches("STRING:").trim().trim_matches('"').to_string();
-            map.insert(idx,value);
+        if let Some((oid, val)) = line.split_once(" = ") {
+            let idx = normalize_oid(oid)
+                .trim_start_matches(base_oid)
+                .trim_start_matches('.')
+                .to_string();
+            let value = val
+                .trim_start_matches("STRING:")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            map.insert(idx, value);
         }
     }
     Ok(map)
 }
 
-fn parse_snmp_value(out: &str) -> Result<String,String> {
+fn parse_snmp_value(out: &str) -> Result<String, String> {
     if let Some(pos) = out.find("STRING:") {
-        Ok(out[pos+7..].trim().trim_matches('"').to_string())
+        Ok(out[pos + 7..].trim().trim_matches('"').to_string())
     } else {
         Err(format!("invalid snmp output: {}", out))
     }
 }
 
 fn normalize_oid(oid: &str) -> String {
-    oid.strip_prefix("iso.").map(|v| format!("1.{}",v)).unwrap_or_else(|| oid.to_string())
+    oid.strip_prefix("iso.")
+        .map(|v| format!("1.{}", v))
+        .unwrap_or_else(|| oid.to_string())
 }
 
 // ----------------- Metrics -----------------
@@ -217,7 +282,10 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
 
     let mut interfaces: HashSet<InterfaceInfo> = HashSet::new();
     for n in &neighbors {
-        interfaces.insert(InterfaceInfo { device: n.local_device.clone(), port: n.local_port.clone() });
+        interfaces.insert(InterfaceInfo {
+            device: n.local_device.clone(),
+            port: n.local_port.clone(),
+        });
     }
     for iface in interfaces {
         let mut tags = MetricTags::default();
@@ -225,7 +293,15 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
         tags.insert("port".into(), iface.port);
         tags.insert("source".into(), "snmp");
         tags.insert("protocol".into(), "interface");
-        metrics.push(Metric::new("interface", MetricKind::Absolute, MetricValue::Gauge { value:1.0 }).with_tags(Some(tags)).with_timestamp(Some(ts)));
+        metrics.push(
+            Metric::new(
+                "interface",
+                MetricKind::Absolute,
+                MetricValue::Gauge { value: 1.0 },
+            )
+            .with_tags(Some(tags))
+            .with_timestamp(Some(ts)),
+        );
     }
 
     for n in neighbors {
@@ -236,7 +312,15 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
         tags.insert("remote_port".into(), n.remote_port);
         tags.insert("source".into(), "snmp");
         tags.insert("protocol".into(), "lldp");
-        metrics.push(Metric::new("link", MetricKind::Absolute, MetricValue::Gauge { value:1.0 }).with_tags(Some(tags)).with_timestamp(Some(ts)));
+        metrics.push(
+            Metric::new(
+                "link",
+                MetricKind::Absolute,
+                MetricValue::Gauge { value: 1.0 },
+            )
+            .with_tags(Some(tags))
+            .with_timestamp(Some(ts)),
+        );
     }
     metrics
 }
