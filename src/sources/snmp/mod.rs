@@ -97,8 +97,8 @@ impl SourceConfig for SnmpSwitchLldpConfig {
 
 // ----------------- OIDs -----------------
 const SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
-const IF_NAME: &str = "1.3.6.1.2.1.31.1.1.1.1";
-const LLDP_LOC_PORT_IFINDEX: &str = "1.0.8802.1.1.2.1.3.7.1.2";
+// const IF_NAME: &str = "1.3.6.1.2.1.31.1.1.1.1";
+const LLDP_LOC_PORT_ID: &str = "1.0.8802.1.1.2.1.3.7.1.3";
 const LLDP_REM_SYS_NAME: &str = "1.0.8802.1.1.2.1.4.1.1.9";
 const LLDP_REM_PORT_ID: &str = "1.0.8802.1.1.2.1.4.1.1.7";
 
@@ -109,60 +109,64 @@ async fn collect_lldp_from_switch(
     auth_protocol: &str,
     auth_password: &str,
 ) -> Result<Vec<LldpNeighbor>, String> {
+    error!("Starting LLDP scrape for {}", target);
 
-    let local_device =
-        snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
+    // 1. local device name
+    let local_device = snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
 
-    // lldpLocPortNum -> ifIndex
-    let lldp_port_ifindex =
-        snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_LOC_PORT_IFINDEX).await?;
+    // 2. LLDP local port table（index -> port name）
+    let lldp_loc_ports =
+        snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_LOC_PORT_ID).await?;
 
-    // ifIndex -> ifName
-    let if_names =
-        snmpwalk_kv(target, user, auth_protocol, auth_password, IF_NAME).await?;
-
-    // key = 0.<locPort>.<remIndex>
+    // 3. LLDP remote table（index -> remote device / remote port）
     let rem_sys =
         snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_SYS_NAME).await?;
-
     let rem_port =
         snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_PORT_ID).await?;
 
-    // ---------- 建 locPort -> ifName 映射 ----------
-    let mut loc_port_name = std::collections::HashMap::new();
-    for (loc_port, if_index) in lldp_port_ifindex {
-        if let Some(if_name) = if_names.get(&if_index) {
-            loc_port_name.insert(loc_port, if_name.clone());
-        }
-    }
+    error!("local_device: {}", local_device);
+    error!("lldp_loc_ports: {:?}", lldp_loc_ports);
+    error!("rem_sys: {:?}", rem_sys);
+    error!("rem_port: {:?}", rem_port);
 
     let mut neighbors = Vec::new();
 
-    // ---------- 以 rem_sys 为主表 ----------
-    for (rem_key, remote_device) in rem_sys {
-        // rem_key: "0.50.71"
-        let parts: Vec<&str> = rem_key.split('.').collect();
-        if parts.len() < 3 {
+    // 远端表里的 key 是 lldpRemTable 的索引，通常是 tuple (local_port_num, rem_index)
+    for (lldp_idx, remote_device) in &rem_sys {
+        error!("Processing lldp_idx: {}", lldp_idx);
+
+        let remote_port_name = match rem_port.get(lldp_idx) {
+            Some(v) => v.clone(),
+            None => {
+                error!("lldp_idx {} not found in rem_port", lldp_idx);
+                continue;
+            }
+        };
+
+        // 解析 lldp_idx，提取本地端口号
+        let local_port_num_str = lldp_idx
+            .split('.')   // 分割 "1.3" -> ["1", "3"]
+            .next()       // 取第一个数字
+            .unwrap_or("");
+
+        if local_port_num_str.is_empty() {
+            error!("lldp_idx {} invalid format", lldp_idx);
             continue;
         }
 
-        let loc_port = parts[1].to_string();
-
-        let local_port = match loc_port_name.get(&loc_port) {
-            Some(p) => p.clone(),
-            None => continue,
+        let local_port_name = match lldp_loc_ports.get(local_port_num_str) {
+            Some(v) => v.clone(),
+            None => {
+                error!("local_port_num {} not found in lldp_loc_ports", local_port_num_str);
+                continue;
+            }
         };
-
-        let remote_port = rem_port
-            .get(&rem_key)
-            .cloned()
-            .unwrap_or_else(|| "<unknown>".to_string());
 
         neighbors.push(LldpNeighbor {
             local_device: local_device.clone(),
-            local_port,
-            remote_device,
-            remote_port,
+            local_port: local_port_name,
+            remote_device: remote_device.clone(),
+            remote_port: remote_port_name,
         });
     }
 
