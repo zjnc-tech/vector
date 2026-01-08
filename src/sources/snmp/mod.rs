@@ -11,16 +11,29 @@ use crate::{
 };
 use vector_lib::configurable::configurable_component;
 
-/// Configuration for the `snmp_switch_lldp` source.
+/// 表示单个集群的配置
+#[configurable_component]
+#[derive(Clone, Debug)]
+pub struct SnmpClusterConfig {
+    /// 集群名称
+    #[configurable(description = "Name of the cluster")]
+    pub name: String,
+    
+    /// 该集群中的目标交换机列表
+    #[configurable(description = "List of switch management IPs or hostnames for this cluster")]
+    pub targets: Vec<String>,
+}
+
+/// Configuration for the `snmp_lldp` source.
 #[configurable_component(source(
-    "snmp_switch_lldp",
+    "snmp_lldp",
     "Collect LLDP neighbors from switches via SNMP"
 ))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SnmpSwitchLldpConfig {
-    #[configurable(description = "List of switch management IPs or hostnames")]
-    pub targets: Vec<String>,
+    #[configurable(description = "List of cluster configurations")]
+    pub clusters: Vec<SnmpClusterConfig>,
     #[configurable(description = "SNMP v3 authentication username")]
     pub user: String,
     #[configurable(description = "SNMP v3 authentication protocol (MD5 or SHA)")]
@@ -53,11 +66,11 @@ struct InterfaceInfo {
 impl_generate_config_from_default!(SnmpSwitchLldpConfig);
 
 #[async_trait::async_trait]
-#[typetag::serde(name = "snmp_switch_lldp")]
+#[typetag::serde(name = "snmp_lldp")]
 impl SourceConfig for SnmpSwitchLldpConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let interval = self.scrape_interval_secs;
-        let targets = self.targets.clone();
+        let clusters = self.clusters.clone();
         let shutdown = cx.shutdown.clone();
         let mut out = cx.out;
         let user = self.user.clone();
@@ -69,22 +82,24 @@ impl SourceConfig for SnmpSwitchLldpConfig {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        for target in &targets {
-                            match collect_lldp_from_switch(target, &user, &auth_protocol, &auth_password).await {
-                                Ok(neighbors) => {
-                                    let metrics = neighbors_to_metrics(neighbors);
-                                    if out.send_batch(metrics).await.is_err() {
-                                        error!("failed to send LLDP metrics");
+                        for cluster in &clusters {
+                            for target in &cluster.targets {
+                                match collect_lldp_from_switch(target, &user, &auth_protocol, &auth_password, &cluster.name).await {
+                                    Ok(neighbors) => {
+                                        let metrics = neighbors_to_metrics(neighbors, &cluster.name);
+                                        if out.send_batch(metrics).await.is_err() {
+                                            error!("failed to send LLDP metrics");
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    error!("SNMP LLDP scrape failed for {}: {}", target, e);
+                                    Err(e) => {
+                                        error!("SNMP LLDP scrape failed for target {} in cluster {}: {}", target, cluster.name, e);
+                                    }
                                 }
                             }
                         }
                     }
                     _ = shutdown.clone() => {
-                        info!("snmp_switch_lldp source shutdown");
+                        info!("snmp_lldp source shutdown");
                         break;
                     }
                 }
@@ -114,8 +129,9 @@ async fn collect_lldp_from_switch(
     user: &str,
     auth_protocol: &str,
     auth_password: &str,
+    cluster_name: &str,
 ) -> Result<Vec<LldpNeighbor>, String> {
-    debug!("Starting LLDP scrape for {}", target);
+    debug!("Starting LLDP scrape for {} in cluster {}", target, cluster_name);
 
     // 1. local device name
     let local_device = snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
@@ -276,7 +292,7 @@ fn normalize_oid(oid: &str) -> String {
 }
 
 // ----------------- Metrics -----------------
-fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
+fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec<Metric> {
     let ts = Utc::now();
     let mut metrics = Vec::new();
 
@@ -291,6 +307,7 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
         let mut tags = MetricTags::default();
         tags.insert("device".into(), iface.device);
         tags.insert("port".into(), iface.port);
+        tags.insert("cluster".into(), cluster_name.to_string());
         tags.insert("source".into(), "snmp");
         tags.insert("protocol".into(), "interface");
         metrics.push(
@@ -310,6 +327,7 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
         tags.insert("local_port".into(), n.local_port);
         tags.insert("remote_device".into(), n.remote_device);
         tags.insert("remote_port".into(), n.remote_port);
+        tags.insert("cluster".into(), cluster_name.to_string());
         tags.insert("source".into(), "snmp");
         tags.insert("protocol".into(), "lldp");
         metrics.push(
@@ -328,7 +346,10 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>) -> Vec<Metric> {
 impl Default for SnmpSwitchLldpConfig {
     fn default() -> Self {
         Self {
-            targets: vec!["127.0.0.1".to_string()],
+            clusters: vec![SnmpClusterConfig {
+                name: "default".to_string(),
+                targets: vec!["127.0.0.1".to_string()],
+            }],
             user: "snmp_user".to_string(),
             auth_protocol: "MD5".to_string(),
             auth_password: "password".to_string(),

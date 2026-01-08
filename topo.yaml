@@ -1,0 +1,20 @@
+sources:
+  snmp:
+    type: snmp_switch_lldp
+    clusters:
+      - name: "v5000"
+        targets: ["10.201.0.1", "10.201.0.2"]
+      - name: "w64"
+        targets: ["10.201.0.3", "10.201.0.4"]
+    user: "snmpv3_alibaba"
+    auth_protocol: "MD5"
+    auth_password: "snmppwv3"
+    scrape_interval_secs: 60
+
+sinks:
+  # 示例输出到控制台
+  console_output:
+    type: console
+    inputs: ["snmp"]
+    encoding:
+      codec: json
