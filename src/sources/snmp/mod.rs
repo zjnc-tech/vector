@@ -18,17 +18,14 @@ pub struct SnmpClusterConfig {
     /// 集群名称
     #[configurable(description = "Name of the cluster")]
     pub name: String,
-    
+
     /// 该集群中的目标交换机列表
     #[configurable(description = "List of switch management IPs or hostnames for this cluster")]
     pub targets: Vec<String>,
 }
 
 /// Configuration for the `snmp_lldp` source.
-#[configurable_component(source(
-    "snmp_lldp",
-    "Collect LLDP neighbors from switches via SNMP"
-))]
+#[configurable_component(source("snmp_lldp", "Collect LLDP neighbors from switches via SNMP"))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SnmpSwitchLldpConfig {
@@ -131,7 +128,10 @@ async fn collect_lldp_from_switch(
     auth_password: &str,
     cluster_name: &str,
 ) -> Result<Vec<LldpNeighbor>, String> {
-    debug!("Starting LLDP scrape for {} in cluster {}", target, cluster_name);
+    debug!(
+        "Starting LLDP scrape for {} in cluster {}",
+        target, cluster_name
+    );
 
     // 1. local device name
     let local_device = snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
@@ -182,8 +182,8 @@ async fn collect_lldp_from_switch(
         };
 
         // 3. 查本地端口名
-        let local_port_name = match lldp_loc_ports.get(local_port_num_str) {
-            Some(v) => v.clone(),
+        let local_port_raw = match lldp_loc_ports.get(local_port_num_str) {
+            Some(v) => v,
             None => {
                 error!(
                     "local_port_num {} not found in lldp_loc_ports",
@@ -192,6 +192,9 @@ async fn collect_lldp_from_switch(
                 continue;
             }
         };
+
+        let local_port_name = normalize_port_name(local_port_raw);
+        let remote_port_name = normalize_port_name(&remote_port_name);
 
         neighbors.push(LldpNeighbor {
             local_device: local_device.clone(),
@@ -291,6 +294,24 @@ fn normalize_oid(oid: &str) -> String {
         .unwrap_or_else(|| oid.to_string())
 }
 
+fn normalize_port_name(port: &str) -> String {
+    // 提取末尾连续数字
+    let digits: String = port
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    if digits.is_empty() {
+        port.to_string()
+    } else {
+        format!("Ethernet{}", digits)
+    }
+}
+
 fn device_role(name: &str) -> &'static str {
     let n = name.to_ascii_uppercase();
     if n.contains("RASW") {
@@ -341,8 +362,8 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec
                 MetricKind::Absolute,
                 MetricValue::Gauge { value: 1.0 },
             )
-                .with_tags(Some(tags))
-                .with_timestamp(Some(ts)),
+            .with_tags(Some(tags))
+            .with_timestamp(Some(ts)),
         );
     }
 
@@ -365,19 +386,9 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec
 
         // 是否需要反转
         let (local_device, local_port, remote_device, remote_port) = if level == Some("2") {
-            (
-                n.remote_device,
-                n.remote_port,
-                n.local_device,
-                n.local_port,
-            )
+            (n.remote_device, n.remote_port, n.local_device, n.local_port)
         } else {
-            (
-                n.local_device,
-                n.local_port,
-                n.remote_device,
-                n.remote_port,
-            )
+            (n.local_device, n.local_port, n.remote_device, n.remote_port)
         };
 
         let mut tags = MetricTags::default();
@@ -399,8 +410,8 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec
                 MetricKind::Absolute,
                 MetricValue::Gauge { value: 1.0 },
             )
-                .with_tags(Some(tags))
-                .with_timestamp(Some(ts)),
+            .with_tags(Some(tags))
+            .with_timestamp(Some(ts)),
         );
     }
 
