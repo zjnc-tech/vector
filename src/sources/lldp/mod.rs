@@ -145,15 +145,15 @@ pub fn map_interfaces_to_metrics(
 
     for interface in interfaces {
         let mut tags = MetricTags::default();
-        tags.insert("name".to_string(), interface.name.clone());
-        tags.insert("device".to_string(), interface.device_name.clone());
-        tags.insert("node_name".to_string(), config.node_name.clone());
-        tags.insert("type".to_string(), "0".to_string());
         tags.insert("cluster".to_string(), config.cluster.clone());
+        tags.insert("device".to_string(), interface.device_name.clone());
+        tags.insert("port".to_string(), interface.name.clone());
+        tags.insert("protocol".to_string(), "interface".to_string());
+        tags.insert("source".to_string(), "lldp".to_string());
 
         metrics.push(
             Metric::new(
-                "lldp_interface",
+                "interface",
                 MetricKind::Absolute,
                 MetricValue::Gauge { value: 1.0 },
             )
@@ -173,27 +173,20 @@ pub fn map_neighbors_to_interface_and_link(
     let mut link_metrics = Vec::new();
 
     for neighbor in neighbors {
-        let remote_type = if neighbor.remote_device.to_lowercase().contains("leaf") {
-            1
-        } else if neighbor.remote_device.to_lowercase().contains("spine") {
-            2
-        } else {
-            3
-        };
-
         let now = Utc::now();
 
         // switch interface
         let mut switch_tags = MetricTags::default();
-        switch_tags.insert("name".to_string(), neighbor.remote_port.clone());
-        switch_tags.insert("device".to_string(), neighbor.remote_device.clone());
-        switch_tags.insert("node_name".to_string(), config.node_name.to_string());
-        switch_tags.insert("type".to_string(), remote_type.to_string());
         switch_tags.insert("cluster".to_string(), config.cluster.clone());
+        switch_tags.insert("device".to_string(), neighbor.remote_device.clone());
+        switch_tags.insert("port".to_string(), neighbor.remote_port.clone());
+        switch_tags.insert("type".to_string(), "0");
+        switch_tags.insert("protocol".to_string(), "interface".to_string());
+        switch_tags.insert("source".to_string(), "lldp-collector".to_string());
 
         interface_metrics.push(
             Metric::new(
-                "lldp_interface",
+                "interface",
                 MetricKind::Absolute,
                 MetricValue::Gauge { value: 1.0 },
             )
@@ -201,25 +194,20 @@ pub fn map_neighbors_to_interface_and_link(
             .with_tags(Some(switch_tags)),
         );
 
-        let level = match remote_type {
-            1 => 0,
-            2 => 1,
-            _ => 0,
-        };
-
         // link
         let mut link_tags = MetricTags::default();
-        link_tags.insert("from_name".to_string(), neighbor.local_interface.clone());
-        link_tags.insert("from_device".to_string(), neighbor.local_device.clone());
-        link_tags.insert("from_node".to_string(), config.node_name.clone());
-        link_tags.insert("to_name".to_string(), neighbor.remote_port.clone());
-        link_tags.insert("to_device".to_string(), neighbor.remote_device.to_string());
         link_tags.insert("cluster".to_string(), config.cluster.clone());
-        link_tags.insert("level".to_string(), level.to_string());
+        link_tags.insert("local_device".to_string(), neighbor.local_device.clone());
+        link_tags.insert("local_port".to_string(), neighbor.local_interface.clone());
+        link_tags.insert("remote_device".to_string(), neighbor.remote_device.clone());
+        link_tags.insert("remote_port".to_string(), neighbor.remote_port.clone());
+        link_tags.insert("level".to_string(), "0");
+        link_tags.insert("protocol".to_string(), "lldp".to_string());
+        link_tags.insert("source".to_string(), "lldp-collector".to_string());
 
         link_metrics.push(
             Metric::new(
-                "lldp_link",
+                "link",
                 MetricKind::Absolute,
                 MetricValue::Gauge { value: 1.0 },
             )

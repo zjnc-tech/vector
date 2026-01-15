@@ -18,17 +18,14 @@ pub struct SnmpClusterConfig {
     /// 集群名称
     #[configurable(description = "Name of the cluster")]
     pub name: String,
-    
+
     /// 该集群中的目标交换机列表
     #[configurable(description = "List of switch management IPs or hostnames for this cluster")]
     pub targets: Vec<String>,
 }
 
 /// Configuration for the `snmp_lldp` source.
-#[configurable_component(source(
-    "snmp_lldp",
-    "Collect LLDP neighbors from switches via SNMP"
-))]
+#[configurable_component(source("snmp_lldp", "Collect LLDP neighbors from switches via SNMP"))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SnmpSwitchLldpConfig {
@@ -131,7 +128,10 @@ async fn collect_lldp_from_switch(
     auth_password: &str,
     cluster_name: &str,
 ) -> Result<Vec<LldpNeighbor>, String> {
-    debug!("Starting LLDP scrape for {} in cluster {}", target, cluster_name);
+    debug!(
+        "Starting LLDP scrape for {} in cluster {}",
+        target, cluster_name
+    );
 
     // 1. local device name
     let local_device = snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
@@ -182,8 +182,8 @@ async fn collect_lldp_from_switch(
         };
 
         // 3. 查本地端口名
-        let local_port_name = match lldp_loc_ports.get(local_port_num_str) {
-            Some(v) => v.clone(),
+        let local_port_raw = match lldp_loc_ports.get(local_port_num_str) {
+            Some(v) => v,
             None => {
                 error!(
                     "local_port_num {} not found in lldp_loc_ports",
@@ -192,6 +192,9 @@ async fn collect_lldp_from_switch(
                 continue;
             }
         };
+
+        let local_port_name = normalize_port_name(local_port_raw);
+        let remote_port_name = normalize_port_name(&remote_port_name);
 
         neighbors.push(LldpNeighbor {
             local_device: local_device.clone(),
@@ -291,7 +294,35 @@ fn normalize_oid(oid: &str) -> String {
         .unwrap_or_else(|| oid.to_string())
 }
 
-// ----------------- Metrics -----------------
+fn normalize_port_name(port: &str) -> String {
+    // 提取末尾连续数字
+    let digits: String = port
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+
+    if digits.is_empty() {
+        port.to_string()
+    } else {
+        format!("Ethernet{}", digits)
+    }
+}
+
+fn device_role(name: &str) -> &'static str {
+    let n = name.to_ascii_uppercase();
+    if n.contains("RASW") {
+        "leaf"
+    } else if n.contains("RDSW") {
+        "spine"
+    } else {
+        "node"
+    }
+}
+
 fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec<Metric> {
     let ts = Utc::now();
     let mut metrics = Vec::new();
@@ -303,13 +334,28 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec
             port: n.local_port.clone(),
         });
     }
+
+    // -------- interface --------
     for iface in interfaces {
+        let role = device_role(&iface.device);
+
         let mut tags = MetricTags::default();
-        tags.insert("device".into(), iface.device);
+        tags.insert("device".into(), iface.device.clone());
         tags.insert("port".into(), iface.port);
         tags.insert("cluster".into(), cluster_name.to_string());
-        tags.insert("source".into(), "snmp");
+        tags.insert("source".into(), "snmp-collector");
         tags.insert("protocol".into(), "interface");
+
+        match role {
+            "leaf" => {
+                tags.insert("type".into(), "1");
+            }
+            "spine" => {
+                tags.insert("type".into(), "2");
+            }
+            _ => {}
+        }
+
         metrics.push(
             Metric::new(
                 "interface",
@@ -321,15 +367,43 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec
         );
     }
 
+    // -------- link --------
     for n in neighbors {
+        let local_role = device_role(&n.local_device);
+        let remote_role = device_role(&n.remote_device);
+
+        let level = match (local_role, remote_role) {
+            ("leaf", "spine") => Some("1"),
+            ("leaf", "node") => Some("2"),
+            ("spine", "leaf") => Some("3"),
+            _ => None,
+        };
+
+        // level 3：直接丢弃
+        if level == Some("3") {
+            continue;
+        }
+
+        // 是否需要反转
+        let (local_device, local_port, remote_device, remote_port) = if level == Some("2") {
+            (n.remote_device, n.remote_port, n.local_device, n.local_port)
+        } else {
+            (n.local_device, n.local_port, n.remote_device, n.remote_port)
+        };
+
         let mut tags = MetricTags::default();
-        tags.insert("local_device".into(), n.local_device);
-        tags.insert("local_port".into(), n.local_port);
-        tags.insert("remote_device".into(), n.remote_device);
-        tags.insert("remote_port".into(), n.remote_port);
+        tags.insert("local_device".into(), local_device);
+        tags.insert("local_port".into(), local_port);
+        tags.insert("remote_device".into(), remote_device);
+        tags.insert("remote_port".into(), remote_port);
         tags.insert("cluster".into(), cluster_name.to_string());
-        tags.insert("source".into(), "snmp");
+        tags.insert("source".into(), "snmp-collector");
         tags.insert("protocol".into(), "lldp");
+
+        if let Some(lv) = level {
+            tags.insert("level".into(), lv);
+        }
+
         metrics.push(
             Metric::new(
                 "link",
@@ -340,9 +414,9 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec
             .with_timestamp(Some(ts)),
         );
     }
+
     metrics
 }
-
 impl Default for SnmpSwitchLldpConfig {
     fn default() -> Self {
         Self {
