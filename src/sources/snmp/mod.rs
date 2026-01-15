@@ -60,6 +60,26 @@ struct InterfaceInfo {
     port: String,
 }
 
+#[derive(Clone, Debug)]
+struct Cluster {
+    name: String,
+    targets: Vec<Target>,
+}
+
+#[derive(Clone, Debug)]
+struct Target {
+    ip: String,
+    vendor: Vendor,
+}
+
+#[derive(Clone, Debug)]
+enum Vendor {
+    CNIT,
+    H3C,
+    Huawei,
+    Unknown,
+}
+
 impl_generate_config_from_default!(SnmpSwitchLldpConfig);
 
 #[async_trait::async_trait]
@@ -67,7 +87,7 @@ impl_generate_config_from_default!(SnmpSwitchLldpConfig);
 impl SourceConfig for SnmpSwitchLldpConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let interval = self.scrape_interval_secs;
-        let clusters = self.clusters.clone();
+        let clusters = self.init_clusters().await;
         let shutdown = cx.shutdown.clone();
         let mut out = cx.out;
         let user = self.user.clone();
@@ -89,7 +109,7 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                                         }
                                     }
                                     Err(e) => {
-                                        error!("SNMP LLDP scrape failed for target {} in cluster {}: {}", target, cluster.name, e);
+                                        error!("SNMP LLDP scrape failed for target {} in cluster {}: {}", target.ip, cluster.name, e);
                                     }
                                 }
                             }
@@ -114,15 +134,91 @@ impl SourceConfig for SnmpSwitchLldpConfig {
     }
 }
 
+impl SnmpSwitchLldpConfig {
+    async fn init_clusters(&self) -> Vec<Cluster> {
+        let mut out = Vec::new();
+
+        for cluster in &self.clusters {
+            let mut targets = Vec::new();
+
+            for ip in &cluster.targets {
+                let sys_descr = snmp_get(
+                    ip,
+                    &self.user,
+                    &self.auth_protocol,
+                    &self.auth_password,
+                    "1.3.6.1.2.1.1.1.0", // sysDescr
+                )
+                .await
+                .unwrap_or_default();
+
+                let vendor = detect_vendor(&sys_descr);
+
+                info!(
+                    "init target={} sysDescr='{}' vendor={:?}",
+                    ip, sys_descr, vendor
+                );
+
+                targets.push(Target {
+                    ip: ip.clone(),
+                    vendor,
+                });
+            }
+
+            out.push(Cluster {
+                name: cluster.name.clone(),
+                targets,
+            });
+        }
+
+        out
+    }
+}
+
+fn detect_vendor(sys_descr: &str) -> Vendor {
+    let s = sys_descr.to_ascii_lowercase();
+
+    if s.contains("cnit") {
+        Vendor::CNIT
+    } else if s.contains("h3c") {
+        Vendor::H3C
+    } else if s.contains("huawei") {
+        Vendor::Huawei
+    } else {
+        Vendor::Unknown
+    }
+}
+
+struct LldpOidSet {
+    loc_port: &'static str,
+    rem_sys: &'static str,
+    rem_port: &'static str,
+}
+
+fn lldp_oids(vendor: &Vendor) -> LldpOidSet {
+    match vendor {
+        Vendor::CNIT | Vendor::H3C | Vendor::Huawei => LldpOidSet {
+            loc_port: "1.0.8802.1.1.2.1.3.7.1.3",
+            rem_sys: "1.0.8802.1.1.2.1.4.1.1.9",
+            rem_port: "1.0.8802.1.1.2.1.4.1.1.7",
+        },
+        Vendor::Unknown => LldpOidSet {
+            loc_port: "1.0.8802.1.1.2.1.3.7.1.3",
+            rem_sys: "1.0.8802.1.1.2.1.4.1.1.9",
+            rem_port: "1.0.8802.1.1.2.1.4.1.1.7",
+        },
+    }
+}
+
 // ----------------- OIDs -----------------
 const SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
-const LLDP_LOC_PORT_ID: &str = "1.0.8802.1.1.2.1.3.7.1.3";
-const LLDP_REM_SYS_NAME: &str = "1.0.8802.1.1.2.1.4.1.1.9";
-const LLDP_REM_PORT_ID: &str = "1.0.8802.1.1.2.1.4.1.1.7";
+// const LLDP_LOC_PORT_ID: &str = "1.0.8802.1.1.2.1.3.7.1.3";
+// const LLDP_REM_SYS_NAME: &str = "1.0.8802.1.1.2.1.4.1.1.9";
+// const LLDP_REM_PORT_ID: &str = "1.0.8802.1.1.2.1.4.1.1.7";
 
 // ----------------- Collect LLDP -----------------
 async fn collect_lldp_from_switch(
-    target: &str,
+    target: &Target,
     user: &str,
     auth_protocol: &str,
     auth_password: &str,
@@ -130,27 +226,34 @@ async fn collect_lldp_from_switch(
 ) -> Result<Vec<LldpNeighbor>, String> {
     debug!(
         "Starting LLDP scrape for {} in cluster {}",
-        target, cluster_name
+        target.ip, cluster_name
     );
 
+    let oids = lldp_oids(&target.vendor);
+
     // 1. local device name
-    let local_device = snmp_get(target, user, auth_protocol, auth_password, SYS_NAME).await?;
+    let local_device = snmp_get(&target.ip, user, auth_protocol, auth_password, SYS_NAME).await?;
 
     // 2. LLDP local port table（index -> port name）
-    let lldp_loc_ports =
-        snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_LOC_PORT_ID).await?;
-
-    // 3. LLDP remote table（index -> remote device / remote port）
-    let rem_sys = snmpwalk_kv(
-        target,
+    let lldp_loc_ports = snmpwalk_kv(
+        &target.ip,
         user,
         auth_protocol,
         auth_password,
-        LLDP_REM_SYS_NAME,
+        oids.loc_port,
     )
     .await?;
-    let rem_port =
-        snmpwalk_kv(target, user, auth_protocol, auth_password, LLDP_REM_PORT_ID).await?;
+
+    // 3. LLDP remote table（index -> remote device / remote port）
+    let rem_sys = snmpwalk_kv(&target.ip, user, auth_protocol, auth_password, oids.rem_sys).await?;
+    let rem_port = snmpwalk_kv(
+        &target.ip,
+        user,
+        auth_protocol,
+        auth_password,
+        oids.rem_port,
+    )
+    .await?;
 
     debug!("local_device: {}", local_device);
     debug!("lldp_loc_ports: {:?}", lldp_loc_ports);
