@@ -11,6 +11,7 @@
 )]
 mod ffi;
 
+use std::env;
 use chrono::Utc;
 use std::time::Duration;
 
@@ -183,6 +184,11 @@ pub fn map_neighbors_to_interface_and_link(
         switch_tags.insert("type".to_string(), "0");
         switch_tags.insert("protocol".to_string(), "interface".to_string());
         switch_tags.insert("source".to_string(), "lldp-collector".to_string());
+
+        let node_ip = env::var("NODE_IP")
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        switch_tags.insert("ip".to_string(), node_ip);
 
         interface_metrics.push(
             Metric::new(

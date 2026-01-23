@@ -1,13 +1,12 @@
 //! SNMP source for collecting LLDP topology information
+use crate::{
+    config::{SourceConfig, SourceContext, SourceOutput},
+    event::metric::{Metric, MetricKind, MetricTags, MetricValue},
+};
 use chrono::Utc;
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
-};
-
-use crate::{
-    config::{SourceConfig, SourceContext, SourceOutput},
-    event::metric::{Metric, MetricKind, MetricTags, MetricValue},
 };
 use vector_lib::configurable::configurable_component;
 
@@ -103,7 +102,7 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                             for target in &cluster.targets {
                                 match collect_lldp_from_switch(target, &user, &auth_protocol, &auth_password, &cluster.name).await {
                                     Ok(neighbors) => {
-                                        let metrics = neighbors_to_metrics(neighbors, &cluster.name);
+                                        let metrics = neighbors_to_metrics(neighbors, &cluster.name, &target.ip);
                                         if out.send_batch(metrics).await.is_err() {
                                             error!("failed to send LLDP metrics");
                                         }
@@ -417,16 +416,16 @@ fn normalize_port_name(port: &str) -> String {
 
 fn device_role(name: &str) -> &'static str {
     let n = name.to_ascii_uppercase();
-    if n.contains("RASW") {
+    if n.contains("RASW") || n.contains("LEAF") {
         "leaf"
-    } else if n.contains("RDSW") {
+    } else if n.contains("RDSW") || n.contains("SPINE") {
         "spine"
     } else {
         "node"
     }
 }
 
-fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec<Metric> {
+fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str, target_ip: &str) -> Vec<Metric> {
     let ts = Utc::now();
     let mut metrics = Vec::new();
 
@@ -448,6 +447,7 @@ fn neighbors_to_metrics(neighbors: Vec<LldpNeighbor>, cluster_name: &str) -> Vec
         tags.insert("cluster".into(), cluster_name.to_string());
         tags.insert("source".into(), "snmp-collector");
         tags.insert("protocol".into(), "interface");
+        tags.insert("ip".into(), target_ip.to_string());
 
         match role {
             "leaf" => {
