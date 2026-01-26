@@ -2,6 +2,7 @@ use crate::sinks::{prelude::*, util::http::HttpRequest};
 // use crate::sinks::{prelude::*};
 use super::config::Format;
 use super::request_builder::ClickhouseRequestBuilder;
+use futures::stream;
 
 /// PartitionKey used to partition events by (database, table) pair.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -96,27 +97,60 @@ where
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         let batch_settings = self.batch_settings;
 
-        // Transform events to extract content field before partitioning and batching
-        let transformed_input = input.map(|mut event| {
-            let logevent = event.as_mut_log();
-            if let Some(Value::Object(content)) = logevent.remove("content") {
-                for (k, v) in content {
-                    logevent.insert(k.as_str(), v);
+        // // Transform events to extract content field before partitioning and batching
+        // let transformed_input = input.map(|mut event| {
+        //     let logevent = event.as_mut_log();
+        //     if let Some(Value::Object(content)) = logevent.remove("contents") {
+        //         for (k, v) in content {
+        //             logevent.insert(k.as_str(), v);
+        //         }
+        //     }
+        //     event
+        // });
+
+        let transformed_input = input.flat_map(|mut event| {
+            let mut out = Vec::new();
+            let log = event.as_mut_log();
+
+            // 保存原始事件中的table字段值
+            let original_table = log.get("table").and_then(|value| {
+                if let Value::Bytes(bytes) = value {
+                    std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+
+            match log.remove("contents") {
+                Some(Value::Array(items)) => {
+                    for item in items {
+                        if let Value::Object(obj) = item {
+                            let mut new_event = event.clone();
+                            let new_log = new_event.as_mut_log();
+
+                            // 确保新事件包含原始事件的table字段
+                            if let Some(ref table) = original_table {
+                                new_log.insert("table", table.clone());
+                            }
+
+                            for (k, v) in obj {
+                                new_log.insert(k.as_str(), v);
+                            }
+
+                            out.push(new_event);
+                        }
+                    }
+                }
+                Some(other) => {
+                    log.insert("contents", other);
+                    out.push(event);
+                }
+                None => {
+                    out.push(event);
                 }
             }
 
-            // If the event is a log and has a "content" field, extract its value to the root level
-            // if let Event::Log(ref mut log_value) = event {
-            //     if let Some(content) = log_value.get("content") {
-            //         for item in content.into_iter(false) { //这里报错了cannot move out of `*content` which is behind a shared reference
-            //             if let IterItem::KeyValue(k,v) = item {
-            //                 log_value.insert(k.as_str(), v.clone());
-            //             }
-            //         }
-            //         log_value.remove("content");
-            //     }
-            // }
-            event
+            stream::iter(out)
         });
 
         transformed_input
