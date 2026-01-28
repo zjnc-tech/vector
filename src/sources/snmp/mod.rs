@@ -1,7 +1,7 @@
 //! SNMP source for collecting LLDP topology information
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
-    event::metric::{Metric, MetricKind, MetricTags, MetricValue},
+    event::LogEvent,
 };
 use chrono::Utc;
 use std::{
@@ -9,6 +9,10 @@ use std::{
     time::Duration,
 };
 use vector_lib::configurable::configurable_component;
+use vector_lib::{config::DataType, schema};
+use vector_lib::config::LogNamespace;
+use vector_lib::lookup::owned_value_path;
+use vrl::value::Kind;
 
 /// 表示单个集群的配置
 #[configurable_component]
@@ -130,13 +134,13 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                                     &cluster.name,
                                 ).await {
                                     Ok(neighbors) => {
-                                        let metrics = neighbors_to_metrics(
+                                        let logs = neighbors_to_logs(
                                             neighbors,
                                             &cluster.name,
                                             &target.ip,
                                         );
-                                        if out.send_batch(metrics).await.is_err() {
-                                            error!("failed to send LLDP metrics");
+                                        if out.send_batch(logs).await.is_err() {
+                                            error!("failed to send LLDP logs");
                                         }
                                     }
                                     Err(e) => {
@@ -159,8 +163,21 @@ impl SourceConfig for SnmpSwitchLldpConfig {
         }))
     }
 
-    fn outputs(&self, _: vector_lib::config::LogNamespace) -> Vec<SourceOutput> {
-        vec![SourceOutput::new_metrics()]
+    fn outputs(&self, _: LogNamespace) -> Vec<SourceOutput> {
+        let definition = schema::Definition::empty_legacy_namespace()
+            .with_event_field(&owned_value_path!("timestamp"), Kind::timestamp(), Some("Time when the event was observed"))
+            .with_event_field(&owned_value_path!("cluster"), Kind::bytes(), Some("Cluster identifier"))
+            .with_event_field(&owned_value_path!("device"), Kind::bytes(), Some("Device name"))
+            .with_event_field(&owned_value_path!("port"), Kind::bytes(), Some("Device port"))
+            .with_event_field(&owned_value_path!("out_band_ip"), Kind::bytes(), Some("Out-of-band IP address"))
+            .with_event_field(&owned_value_path!("type"), Kind::integer(), Some("Device type (0=node, 1=leaf, 2=spine)"))
+            .with_event_field(&owned_value_path!("from_device"), Kind::bytes(), Some("Source device in connection"))
+            .with_event_field(&owned_value_path!("from_port"), Kind::bytes(), Some("Source port in connection"))
+            .with_event_field(&owned_value_path!("to_device"), Kind::bytes(), Some("Destination device in connection"))
+            .with_event_field(&owned_value_path!("to_port"), Kind::bytes(), Some("Destination port in connection"))
+            .with_event_field(&owned_value_path!("log_type"), Kind::bytes(), Some("Type of log: interface or link"));
+
+        vec![SourceOutput::new_maybe_logs(DataType::Log, definition)]
     }
 
     fn can_acknowledge(&self) -> bool {
@@ -506,13 +523,13 @@ fn device_role(name: &str) -> &'static str {
     }
 }
 
-fn neighbors_to_metrics(
+fn neighbors_to_logs(
     neighbors: Vec<LldpNeighbor>,
     cluster_name: &str,
     target_ip: &str,
-) -> Vec<Metric> {
+) -> Vec<LogEvent> {
     let ts = Utc::now();
-    let mut metrics = Vec::new();
+    let mut logs = Vec::new();
 
     let mut interfaces = HashSet::new();
     for n in &neighbors {
@@ -522,72 +539,43 @@ fn neighbors_to_metrics(
         });
     }
 
+    // 创建interface日志 - 存储设备的本地name和port
     for iface in interfaces {
         let role = device_role(&iface.device);
 
-        let mut tags = MetricTags::default();
-        tags.insert("device".into(), iface.device);
-        tags.insert("port".into(), iface.port);
-        tags.insert("cluster".into(), cluster_name.to_string());
-        tags.insert("source".into(), "snmp-collector");
-        tags.insert("protocol".into(), "interface");
-        tags.insert("ip".into(), target_ip.to_string());
-
-        match role {
-            "leaf" => tags.insert("type".into(), "1"),
-            "spine" => tags.insert("type".into(), "2"),
-            _ => {}
+        let mut log = LogEvent::default();
+        log.insert("timestamp", ts);
+        log.insert("cluster", cluster_name.to_string());
+        log.insert("device", iface.device);
+        log.insert("port", iface.port);
+        log.insert("out_band_ip", target_ip.to_string());
+        
+        let device_type = match role {
+            "leaf" => 1i64,
+            "spine" => 2i64,
+            _ => 0i64,
         };
-
-        metrics.push(
-            Metric::new("interface", MetricKind::Absolute, MetricValue::Gauge { value: 1.0 })
-                .with_tags(Some(tags))
-                .with_timestamp(Some(ts)),
-        );
+        log.insert("type", device_type);
+        log.insert("log_type", "interface".to_string()); // 标识这是interface日志
+        
+        logs.push(log);
     }
 
+    // 创建link日志 - 存储连接关系，包含from-name、from-port和remote-name、remote-port字段
     for n in neighbors {
-        let local_role = device_role(&n.local_device);
-        let remote_role = device_role(&n.remote_device);
-
-        let level = match (local_role, remote_role) {
-            ("leaf", "spine") => Some("1"),
-            ("leaf", "node") => Some("2"),
-            ("spine", "leaf") => Some("3"),
-            _ => None,
-        };
-
-        if level == Some("3") {
-            continue;
-        }
-
-        let (ld, lp, rd, rp) = if level == Some("2") {
-            (n.remote_device, n.remote_port, n.local_device, n.local_port)
-        } else {
-            (n.local_device, n.local_port, n.remote_device, n.remote_port)
-        };
-
-        let mut tags = MetricTags::default();
-        tags.insert("local_device".into(), ld);
-        tags.insert("local_port".into(), lp);
-        tags.insert("remote_device".into(), rd);
-        tags.insert("remote_port".into(), rp);
-        tags.insert("cluster".into(), cluster_name.to_string());
-        tags.insert("source".into(), "snmp-collector");
-        tags.insert("protocol".into(), "lldp");
-
-        if let Some(lv) = level {
-            tags.insert("level".into(), lv);
-        }
-
-        metrics.push(
-            Metric::new("link", MetricKind::Absolute, MetricValue::Gauge { value: 1.0 })
-                .with_tags(Some(tags))
-                .with_timestamp(Some(ts)),
-        );
+        let mut log = LogEvent::default();
+        log.insert("timestamp", ts);
+        log.insert("cluster", cluster_name.to_string());
+        log.insert("from_device", n.local_device);      // from-name
+        log.insert("from_port", n.local_port);          // from-port
+        log.insert("to_device", n.remote_device);       // remote-name
+        log.insert("to_port", n.remote_port);           // remote-port
+        log.insert("log_type", "link".to_string());     // 标识这是link日志
+        
+        logs.push(log);
     }
 
-    metrics
+    logs
 }
 
 impl Default for SnmpSwitchLldpConfig {
