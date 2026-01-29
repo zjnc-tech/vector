@@ -1,7 +1,7 @@
 //! SNMP source for collecting LLDP topology information
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
-    event::LogEvent,
+    event::{LogEvent, Value},
 };
 use chrono::Utc;
 use std::{
@@ -544,19 +544,19 @@ fn neighbors_to_logs(
         let role = device_role(&iface.device);
 
         let mut log = LogEvent::default();
-        log.insert("timestamp", ts);
-        log.insert("cluster", cluster_name.to_string());
-        log.insert("device", iface.device);
-        log.insert("port", iface.port);
-        log.insert("out_band_ip", target_ip.to_string());
+        log.insert("timestamp", Value::Timestamp(ts));  // 使用Value::Timestamp以确保兼容性
+        log.insert("cluster", Value::from(cluster_name.to_string()));
+        log.insert("device", Value::from(iface.device));
+        log.insert("port", Value::from(iface.port));
+        log.insert("out_band_ip", Value::from(target_ip.to_string()));
         
-        let device_type = match role {
-            "leaf" => 1i64,
-            "spine" => 2i64,
-            _ => 0i64,
-        };
-        log.insert("type", device_type);
-        log.insert("log_type", "interface".to_string()); // 标识这是interface日志
+        // let device_type = match role {
+        //     "leaf" => 1i64,
+        //     "spine" => 2i64,
+        //     _ => 0i64,
+        // };
+        log.insert("type", Value::from(role));
+        log.insert("log_type", Value::from("interface".to_string())); // 标识这是interface日志
         
         logs.push(log);
     }
@@ -564,13 +564,13 @@ fn neighbors_to_logs(
     // 创建link日志 - 存储连接关系，包含from-name、from-port和remote-name、remote-port字段
     for n in neighbors {
         let mut log = LogEvent::default();
-        log.insert("timestamp", ts);
-        log.insert("cluster", cluster_name.to_string());
-        log.insert("from_device", n.local_device);      // from-name
-        log.insert("from_port", n.local_port);          // from-port
-        log.insert("to_device", n.remote_device);       // remote-name
-        log.insert("to_port", n.remote_port);           // remote-port
-        log.insert("log_type", "link".to_string());     // 标识这是link日志
+        log.insert("timestamp", Value::Timestamp(ts));  // 使用Value::Timestamp以确保兼容性
+        log.insert("cluster", Value::from(cluster_name.to_string()));
+        log.insert("from_device", Value::from(n.local_device));      // from-name
+        log.insert("from_port", Value::from(n.local_port));          // from-port
+        log.insert("to_device", Value::from(n.remote_device));       // remote-name
+        log.insert("to_port", Value::from(n.remote_port));           // remote-port
+        log.insert("log_type", Value::from("link".to_string()));     // 标识这是link日志
         
         logs.push(log);
     }
