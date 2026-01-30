@@ -419,14 +419,6 @@ async fn collect_lldp_from_switch(
             remote_device: remote_device.clone(),
             remote_port: normalize_port_name(&remote_port_name),
         });
-
-        // // 同时也添加到interfaces列表（如果还没有的话）
-        // if !interfaces.iter().any(|iface| iface.port == local_port) {
-        //     interfaces.push(LocalInterface {
-        //         device: local_device.clone(),
-        //         port: local_port,
-        //     });
-        // }
     }
 
     Ok((interfaces, neighbors))
@@ -550,11 +542,9 @@ async fn snmpwalk_kv(
                 .trim_start_matches(base_oid)
                 .trim_start_matches('.')
                 .to_string();
-            let value = val
-                .trim_start_matches("STRING:")
-                .trim()
-                .trim_matches('"')
-                .to_string();
+            
+            // 处理各种前缀，如 "Hex-STRING:", "STRING:"
+            let value = process_snmp_value(val);
             map.insert(idx, value);
         }
     }
@@ -562,9 +552,26 @@ async fn snmpwalk_kv(
     Ok(map)
 }
 
+// 处理SNMP值的函数
+fn process_snmp_value(val: &str) -> String {
+    let trimmed = val.trim();
+    
+    // 处理可能的前缀，然后清理引号
+    let without_prefix = if let Some(stripped) = trimmed.strip_prefix("STRING:") {
+        stripped.trim()
+    } else if let Some(stripped) = trimmed.strip_prefix("Hex-STRING:") {
+        stripped.trim()
+    } else {
+        trimmed
+    };
+    
+    // 清理引号
+    without_prefix.trim_matches('"').to_string()
+}
+
 fn parse_snmp_value(out: &str) -> Result<String, String> {
     if let Some(pos) = out.find("STRING:") {
-        Ok(out[pos + 7..].trim().trim_matches('"').to_string())
+        Ok(process_snmp_value(&out[pos + 7..]))
     } else {
         Err(format!("invalid snmp output: {}", out))
     }
