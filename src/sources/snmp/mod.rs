@@ -4,10 +4,7 @@ use crate::{
     event::{LogEvent, Value},
 };
 use chrono::Utc;
-use std::{
-    collections::HashMap,
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 use vector_lib::config::LogNamespace;
 use vector_lib::configurable::configurable_component;
 use vector_lib::lookup::owned_value_path;
@@ -542,7 +539,7 @@ async fn snmpwalk_kv(
                 .trim_start_matches(base_oid)
                 .trim_start_matches('.')
                 .to_string();
-            
+
             // 处理各种前缀，如 "Hex-STRING:", "STRING:"
             let value = process_snmp_value(val);
             map.insert(idx, value);
@@ -555,7 +552,7 @@ async fn snmpwalk_kv(
 // 处理SNMP值的函数
 fn process_snmp_value(val: &str) -> String {
     let trimmed = val.trim();
-    
+
     // 处理可能的前缀，然后清理引号
     let without_prefix = if let Some(stripped) = trimmed.strip_prefix("STRING:") {
         stripped.trim()
@@ -564,7 +561,7 @@ fn process_snmp_value(val: &str) -> String {
     } else {
         trimmed
     };
-    
+
     // 清理引号
     without_prefix.trim_matches('"').to_string()
 }
@@ -628,20 +625,43 @@ fn neighbors_to_logs(
 
     // 创建link日志 - 存储连接关系，包含from-name、from-port和remote-name、remote-port字段
     for n in neighbors {
-        let from_interface_normalized = normalize_port_name(&n.local_port);
-        let to_interface_normalized = normalize_port_name(&n.remote_device);
+        let local_role = device_role(&n.local_device);
+        let remote_role = device_role(&n.remote_device);
+
+        let level = match (local_role, remote_role) {
+            ("leaf", "spine") => Some("1"),
+            ("leaf", "node") => Some("2"),
+            ("spine", "leaf") => Some("3"),
+            _ => None,
+        };
+
+        // level 3：直接丢弃
+        if level == Some("3") {
+            continue;
+        }
+
+        // 是否需要反转
+        let (local_device, local_port, remote_device, remote_port) = if level == Some("2") {
+            (n.remote_device, n.remote_port, n.local_device, n.local_port)
+        } else {
+            (n.local_device, n.local_port, n.remote_device, n.remote_port)
+        };
+
+        let from_interface_normalized = normalize_port_name(&local_port);
+        let to_interface_normalized = normalize_port_name(&remote_port);
 
         let mut log = LogEvent::default();
         log.insert("timestamp", Value::Timestamp(ts)); // 使用Value::Timestamp以确保兼容性
         log.insert("cluster", Value::from(cluster_name.to_string()));
-        log.insert("from_device", Value::from(n.local_device)); // from-name
-        log.insert("from_interface", Value::from(n.local_port)); // from-port
+        log.insert("level", Value::from(level));
+        log.insert("from_device", Value::from(local_device)); // from-name
+        log.insert("from_interface", Value::from(local_port)); // from-port
         log.insert(
             "from_interface_normalized",
             Value::from(from_interface_normalized),
         );
-        log.insert("to_device", Value::from(n.remote_device)); // remote-name
-        log.insert("to_interface", Value::from(n.remote_port)); // remote-port
+        log.insert("to_device", Value::from(remote_device)); // remote-name
+        log.insert("to_interface", Value::from(remote_port)); // remote-port
         log.insert(
             "to_interface_normalized",
             Value::from(to_interface_normalized),
