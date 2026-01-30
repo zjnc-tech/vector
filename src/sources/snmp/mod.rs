@@ -5,13 +5,13 @@ use crate::{
 };
 use chrono::Utc;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::Duration,
 };
-use vector_lib::configurable::configurable_component;
-use vector_lib::{config::DataType, schema};
 use vector_lib::config::LogNamespace;
+use vector_lib::configurable::configurable_component;
 use vector_lib::lookup::owned_value_path;
+use vector_lib::{config::DataType, schema};
 use vrl::value::Kind;
 
 /// 表示单个集群的配置
@@ -72,8 +72,8 @@ struct LldpNeighbor {
     remote_port: String,
 }
 
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
-struct InterfaceInfo {
+#[derive(Debug, Clone)]
+struct LocalInterface {
     device: String,
     port: String,
 }
@@ -133,8 +133,9 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                                     &priv_password,
                                     &cluster.name,
                                 ).await {
-                                    Ok(neighbors) => {
+                                    Ok((interfaces, neighbors)) => {  // 修改这里以接收两个返回值
                                         let logs = neighbors_to_logs(
+                                            interfaces,
                                             neighbors,
                                             &cluster.name,
                                             &target.ip,
@@ -165,17 +166,61 @@ impl SourceConfig for SnmpSwitchLldpConfig {
 
     fn outputs(&self, _: LogNamespace) -> Vec<SourceOutput> {
         let definition = schema::Definition::empty_legacy_namespace()
-            .with_event_field(&owned_value_path!("timestamp"), Kind::timestamp(), Some("Time when the event was observed"))
-            .with_event_field(&owned_value_path!("cluster"), Kind::bytes(), Some("Cluster identifier"))
-            .with_event_field(&owned_value_path!("device"), Kind::bytes(), Some("Device name"))
-            .with_event_field(&owned_value_path!("port"), Kind::bytes(), Some("Device port"))
-            .with_event_field(&owned_value_path!("out_band_ip"), Kind::bytes(), Some("Out-of-band IP address"))
-            .with_event_field(&owned_value_path!("type"), Kind::integer(), Some("Device type (0=node, 1=leaf, 2=spine)"))
-            .with_event_field(&owned_value_path!("from_device"), Kind::bytes(), Some("Source device in connection"))
-            .with_event_field(&owned_value_path!("from_port"), Kind::bytes(), Some("Source port in connection"))
-            .with_event_field(&owned_value_path!("to_device"), Kind::bytes(), Some("Destination device in connection"))
-            .with_event_field(&owned_value_path!("to_port"), Kind::bytes(), Some("Destination port in connection"))
-            .with_event_field(&owned_value_path!("log_type"), Kind::bytes(), Some("Type of log: interface or link"));
+            .with_event_field(
+                &owned_value_path!("timestamp"),
+                Kind::timestamp(),
+                Some("Time when the event was observed"),
+            )
+            .with_event_field(
+                &owned_value_path!("cluster"),
+                Kind::bytes(),
+                Some("Cluster identifier"),
+            )
+            .with_event_field(
+                &owned_value_path!("device"),
+                Kind::bytes(),
+                Some("Device name"),
+            )
+            .with_event_field(
+                &owned_value_path!("port"),
+                Kind::bytes(),
+                Some("Device port"),
+            )
+            .with_event_field(
+                &owned_value_path!("out_band_ip"),
+                Kind::bytes(),
+                Some("Out-of-band IP address"),
+            )
+            .with_event_field(
+                &owned_value_path!("type"),
+                Kind::integer(),
+                Some("Device type (0=node, 1=leaf, 2=spine)"),
+            )
+            .with_event_field(
+                &owned_value_path!("from_device"),
+                Kind::bytes(),
+                Some("Source device in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("from_port"),
+                Kind::bytes(),
+                Some("Source port in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("to_device"),
+                Kind::bytes(),
+                Some("Destination device in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("to_port"),
+                Kind::bytes(),
+                Some("Destination port in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("log_type"),
+                Kind::bytes(),
+                Some("Type of log: interface or link"),
+            );
 
         vec![SourceOutput::new_maybe_logs(DataType::Log, definition)]
     }
@@ -203,8 +248,8 @@ impl SnmpSwitchLldpConfig {
                     &self.priv_password,
                     "1.3.6.1.2.1.1.1.0",
                 )
-                    .await
-                    .unwrap_or_default();
+                .await
+                .unwrap_or_default();
 
                 let vendor = detect_vendor(&sys_descr);
 
@@ -269,7 +314,7 @@ async fn collect_lldp_from_switch(
     priv_protocol: &Option<String>,
     priv_password: &Option<String>,
     cluster_name: &str,
-) -> Result<Vec<LldpNeighbor>, String> {
+) -> Result<(Vec<LocalInterface>, Vec<LldpNeighbor>), String> {
     debug!(
         "Starting LLDP scrape for {} in cluster {}",
         target.ip, cluster_name
@@ -287,8 +332,22 @@ async fn collect_lldp_from_switch(
         priv_password,
         SYS_NAME,
     )
-        .await?;
+    .await?;
 
+    // 获取本地所有端口信息
+    let local_ports = snmpwalk_kv(
+        &target.ip,
+        user,
+        auth_protocol,
+        auth_password,
+        security_level,
+        priv_protocol,
+        priv_password,
+        "1.3.6.1.2.1.2.2.1.2", // ifDescr OID - 获取所有接口描述
+    )
+    .await?;
+
+    // 获取LLDP本地端口信息
     let lldp_loc_ports = snmpwalk_kv(
         &target.ip,
         user,
@@ -299,7 +358,7 @@ async fn collect_lldp_from_switch(
         priv_password,
         oids.loc_port,
     )
-        .await?;
+    .await?;
 
     let rem_sys = snmpwalk_kv(
         &target.ip,
@@ -311,7 +370,7 @@ async fn collect_lldp_from_switch(
         priv_password,
         oids.rem_sys,
     )
-        .await?;
+    .await?;
 
     let rem_port = snmpwalk_kv(
         &target.ip,
@@ -323,10 +382,20 @@ async fn collect_lldp_from_switch(
         priv_password,
         oids.rem_port,
     )
-        .await?;
+    .await?;
 
+    let mut interfaces = Vec::new();
     let mut neighbors = Vec::new();
 
+    // 收集所有本地接口
+    for (_, port_desc) in &local_ports {
+        interfaces.push(LocalInterface {
+            device: local_device.clone(),
+            port: port_desc.to_string(),
+        });
+    }
+
+    // 收集LLDP邻居信息（有对端连接的端口）
     for (lldp_idx, remote_device) in &rem_sys {
         let remote_port_name = match rem_port.get(lldp_idx) {
             Some(v) => v.clone(),
@@ -346,13 +415,21 @@ async fn collect_lldp_from_switch(
 
         neighbors.push(LldpNeighbor {
             local_device: local_device.clone(),
-            local_port: normalize_port_name(local_port_raw),
+            local_port: local_port_raw.clone(),
             remote_device: remote_device.clone(),
             remote_port: normalize_port_name(&remote_port_name),
         });
+
+        // // 同时也添加到interfaces列表（如果还没有的话）
+        // if !interfaces.iter().any(|iface| iface.port == local_port) {
+        //     interfaces.push(LocalInterface {
+        //         device: local_device.clone(),
+        //         port: local_port,
+        //     });
+        // }
     }
 
-    Ok(neighbors)
+    Ok((interfaces, neighbors))
 }
 
 // ----------------- SNMP helpers -----------------
@@ -383,8 +460,12 @@ fn build_snmpv3_args(
             ]);
         }
         "authPriv" => {
-            let proto = priv_protocol.as_ref().ok_or("priv_protocol required for authPriv")?;
-            let pass = priv_password.as_ref().ok_or("priv_password required for authPriv")?;
+            let proto = priv_protocol
+                .as_ref()
+                .ok_or("priv_protocol required for authPriv")?;
+            let pass = priv_password
+                .as_ref()
+                .ok_or("priv_password required for authPriv")?;
 
             args.extend([
                 "-a".into(),
@@ -496,20 +577,8 @@ fn normalize_oid(oid: &str) -> String {
 }
 
 fn normalize_port_name(port: &str) -> String {
-    let digits: String = port
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-
-    if digits.is_empty() {
-        port.to_string()
-    } else {
-        format!("Ethernet{}", digits)
-    }
+    // 直接返回原始端口名称，不做任何处理
+    port.to_string()
 }
 
 fn device_role(name: &str) -> &'static str {
@@ -524,6 +593,7 @@ fn device_role(name: &str) -> &'static str {
 }
 
 fn neighbors_to_logs(
+    interfaces: Vec<LocalInterface>,
     neighbors: Vec<LldpNeighbor>,
     cluster_name: &str,
     target_ip: &str,
@@ -531,47 +601,46 @@ fn neighbors_to_logs(
     let ts = Utc::now();
     let mut logs = Vec::new();
 
-    let mut interfaces = HashSet::new();
-    for n in &neighbors {
-        interfaces.insert(InterfaceInfo {
-            device: n.local_device.clone(),
-            port: n.local_port.clone(),
-        });
-    }
-
     // 创建interface日志 - 存储设备的本地name和port
     for iface in interfaces {
         let role = device_role(&iface.device);
+        let normalized_port = normalize_port_name(&iface.port);
 
         let mut log = LogEvent::default();
-        log.insert("timestamp", Value::Timestamp(ts));  // 使用Value::Timestamp以确保兼容性
+        log.insert("timestamp", Value::Timestamp(ts)); // 使用Value::Timestamp以确保兼容性
         log.insert("cluster", Value::from(cluster_name.to_string()));
         log.insert("device", Value::from(iface.device));
-        log.insert("port", Value::from(iface.port));
+        log.insert("interface", Value::from(iface.port));
+        log.insert("interface_normalized", Value::from(normalized_port));
         log.insert("out_band_ip", Value::from(target_ip.to_string()));
-        
-        // let device_type = match role {
-        //     "leaf" => 1i64,
-        //     "spine" => 2i64,
-        //     _ => 0i64,
-        // };
         log.insert("type", Value::from(role));
         log.insert("log_type", Value::from("interface".to_string())); // 标识这是interface日志
-        
+
         logs.push(log);
     }
 
     // 创建link日志 - 存储连接关系，包含from-name、from-port和remote-name、remote-port字段
     for n in neighbors {
+        let from_interface_normalized = normalize_port_name(&n.local_port);
+        let to_interface_normalized = normalize_port_name(&n.remote_device);
+
         let mut log = LogEvent::default();
-        log.insert("timestamp", Value::Timestamp(ts));  // 使用Value::Timestamp以确保兼容性
+        log.insert("timestamp", Value::Timestamp(ts)); // 使用Value::Timestamp以确保兼容性
         log.insert("cluster", Value::from(cluster_name.to_string()));
-        log.insert("from_device", Value::from(n.local_device));      // from-name
-        log.insert("from_port", Value::from(n.local_port));          // from-port
-        log.insert("to_device", Value::from(n.remote_device));       // remote-name
-        log.insert("to_port", Value::from(n.remote_port));           // remote-port
-        log.insert("log_type", Value::from("link".to_string()));     // 标识这是link日志
-        
+        log.insert("from_device", Value::from(n.local_device)); // from-name
+        log.insert("from_interface", Value::from(n.local_port)); // from-port
+        log.insert(
+            "from_interface_normalized",
+            Value::from(from_interface_normalized),
+        );
+        log.insert("to_device", Value::from(n.remote_device)); // remote-name
+        log.insert("to_interface", Value::from(n.remote_port)); // remote-port
+        log.insert(
+            "to_interface_normalized",
+            Value::from(to_interface_normalized),
+        );
+        log.insert("log_type", Value::from("link".to_string())); // 标识这是link日志
+
         logs.push(log);
     }
 
