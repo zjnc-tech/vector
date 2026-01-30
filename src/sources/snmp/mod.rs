@@ -22,6 +22,37 @@ pub struct SnmpClusterConfig {
     /// 该集群中的目标交换机列表
     #[configurable(description = "List of switch management IPs or hostnames for this cluster")]
     pub targets: Vec<String>,
+
+    /// SNMP v3用户名
+    #[configurable(description = "SNMP v3 username for this cluster")]
+    pub user: String,
+
+    /// SNMP v3认证协议 (MD5 or SHA)
+    #[configurable(description = "SNMP v3 authentication protocol (MD5 or SHA)")]
+    pub auth_protocol: String,
+
+    /// SNMP v3认证密码
+    #[configurable(description = "SNMP v3 authentication password")]
+    pub auth_password: String,
+
+    /// SNMP v3安全级别: noAuthNoPriv | authNoPriv | authPriv
+    #[configurable(description = "SNMP v3 security level: noAuthNoPriv | authNoPriv | authPriv")]
+    pub security_level: String,
+
+    /// SNMP v3隐私协议 (AES/DES), 仅authPriv时需要
+    #[serde(default)]
+    #[configurable(description = "SNMP v3 privacy protocol (AES/DES), required for authPriv")]
+    pub priv_protocol: Option<String>,
+
+    /// SNMP v3隐私密码, 仅authPriv时需要
+    #[serde(default)]
+    #[configurable(description = "SNMP v3 privacy password, required for authPriv")]
+    pub priv_password: Option<String>,
+
+    /// 采集间隔时间(秒)
+    #[serde(default = "default_interval")]
+    #[configurable(description = "Scrape interval in seconds for this cluster")]
+    pub scrape_interval_secs: u64,
 }
 
 /// Configuration for the `snmp_lldp` source.
@@ -31,30 +62,6 @@ pub struct SnmpClusterConfig {
 pub struct SnmpSwitchLldpConfig {
     #[configurable(description = "List of cluster configurations")]
     pub clusters: Vec<SnmpClusterConfig>,
-
-    #[configurable(description = "SNMP v3 username")]
-    pub user: String,
-
-    #[configurable(description = "SNMP v3 authentication protocol (MD5 or SHA)")]
-    pub auth_protocol: String,
-
-    #[configurable(description = "SNMP v3 authentication password")]
-    pub auth_password: String,
-
-    #[configurable(description = "SNMP v3 security level: noAuthNoPriv | authNoPriv | authPriv")]
-    pub security_level: String,
-
-    #[configurable(description = "SNMP v3 privacy protocol (AES/DES), required for authPriv")]
-    #[serde(default)]
-    pub priv_protocol: Option<String>,
-
-    #[configurable(description = "SNMP v3 privacy password, required for authPriv")]
-    #[serde(default)]
-    pub priv_password: Option<String>,
-
-    #[configurable(description = "Scrape interval in seconds")]
-    #[serde(default = "default_interval")]
-    pub scrape_interval_secs: u64,
 }
 
 const fn default_interval() -> u64 {
@@ -73,12 +80,6 @@ struct LldpNeighbor {
 struct LocalInterface {
     device: String,
     port: String,
-}
-
-#[derive(Clone, Debug)]
-struct Cluster {
-    name: String,
-    targets: Vec<Target>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,62 +102,48 @@ impl_generate_config_from_default!(SnmpSwitchLldpConfig);
 #[typetag::serde(name = "snmp_lldp")]
 impl SourceConfig for SnmpSwitchLldpConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
-        let interval = self.scrape_interval_secs;
-        let clusters = self.init_clusters().await;
         let shutdown = cx.shutdown.clone();
-        let mut out = cx.out;
-
-        let user = self.user.clone();
-        let auth_protocol = self.auth_protocol.clone();
-        let auth_password = self.auth_password.clone();
-        let security_level = self.security_level.clone();
-        let priv_protocol = self.priv_protocol.clone();
-        let priv_password = self.priv_password.clone();
+        let out = cx.out;
+        let clusters = self.clusters.clone();
 
         Ok(Box::pin(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        for cluster in &clusters {
-                            for target in &cluster.targets {
-                                match collect_lldp_from_switch(
-                                    target,
-                                    &user,
-                                    &auth_protocol,
-                                    &auth_password,
-                                    &security_level,
-                                    &priv_protocol,
-                                    &priv_password,
-                                    &cluster.name,
-                                ).await {
-                                    Ok((interfaces, neighbors)) => {  // 修改这里以接收两个返回值
-                                        let logs = neighbors_to_logs(
-                                            interfaces,
-                                            neighbors,
-                                            &cluster.name,
-                                            &target.ip,
-                                        );
-                                        if out.send_batch(logs).await.is_err() {
-                                            error!("failed to send LLDP logs");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "SNMP LLDP scrape failed for target {} in cluster {}: {}",
-                                            target.ip, cluster.name, e
-                                        );
-                                    }
+            let mut cluster_handles = Vec::new();
+
+            // 为每个集群启动一个独立的任务
+            for cluster_config in clusters {
+                let mut out_clone = out.clone();  // 需要可变引用以发送批次
+                let shutdown_clone = shutdown.clone();
+
+                let handle = tokio::spawn(async move {
+                    let mut cluster_shutdown = shutdown_clone;
+                    
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(cluster_config.scrape_interval_secs)) => {
+                                let cluster_logs = collect_cluster_data_with_config(
+                                    &cluster_config,
+                                ).await;
+                                
+                                if let Err(e) = out_clone.send_batch(cluster_logs).await {
+                                    error!("failed to send cluster {} logs: {}", cluster_config.name, e);
                                 }
+                            }
+                            _ = &mut cluster_shutdown => {
+                                info!("Cluster {} shutdown", cluster_config.name);
+                                break;
                             }
                         }
                     }
-                    _ = shutdown.clone() => {
-                        info!("snmp_lldp source shutdown");
-                        break;
-                    }
-                }
+                });
+
+                cluster_handles.push(handle);
             }
+
+            // 等待所有集群任务完成
+            for handle in cluster_handles {
+                let _ = handle.await;
+            }
+
             Ok(())
         }))
     }
@@ -227,47 +214,109 @@ impl SourceConfig for SnmpSwitchLldpConfig {
     }
 }
 
-impl SnmpSwitchLldpConfig {
-    async fn init_clusters(&self) -> Vec<Cluster> {
-        let mut out = Vec::new();
+// 新增函数：使用集群特定配置采集数据
+async fn collect_cluster_data_with_config(cluster_config: &SnmpClusterConfig) -> Vec<LogEvent> {
+    let mut all_logs = Vec::new();
 
-        for cluster in &self.clusters {
-            let mut targets = Vec::new();
+    // 初始化集群中的目标
+    let targets = init_targets(&cluster_config.targets, cluster_config).await;
 
-            for ip in &cluster.targets {
-                let sys_descr = snmp_get(
-                    ip,
-                    &self.user,
-                    &self.auth_protocol,
-                    &self.auth_password,
-                    &self.security_level,
-                    &self.priv_protocol,
-                    &self.priv_password,
-                    "1.3.6.1.2.1.1.1.0",
-                )
-                .await
-                .unwrap_or_default();
+    // 并发采集集群中每个目标的数据
+    let mut tasks = Vec::new();
+    for target in &targets {
+        let task = tokio::spawn(collect_single_target_with_config(
+            target.clone(),
+            cluster_config.user.clone(),
+            cluster_config.auth_protocol.clone(),
+            cluster_config.auth_password.clone(),
+            cluster_config.security_level.clone(),
+            cluster_config.priv_protocol.clone(),
+            cluster_config.priv_password.clone(),
+            cluster_config.name.clone(),
+        ));
+        tasks.push(task);
+    }
 
-                let vendor = detect_vendor(&sys_descr);
-
-                info!(
-                    "init target={} sysDescr='{}' vendor={:?}",
-                    ip, sys_descr, vendor
-                );
-
-                targets.push(Target {
-                    ip: ip.clone(),
-                    vendor,
-                });
-            }
-
-            out.push(Cluster {
-                name: cluster.name.clone(),
-                targets,
-            });
+    // 等待所有任务完成并收集结果
+    for task in tasks {
+        match task.await {
+            Ok(Ok(logs)) => all_logs.extend(logs),
+            Ok(Err(e)) => error!("Failed to collect data from target: {}", e),
+            Err(e) => error!("Task failed: {}", e),
         }
+    }
 
-        out
+    all_logs
+}
+
+// 初始化目标
+async fn init_targets(targets: &[String], cluster_config: &SnmpClusterConfig) -> Vec<Target> {
+    let mut result = Vec::new();
+
+    for ip in targets {
+        let sys_descr = snmp_get(
+            ip,
+            &cluster_config.user,
+            &cluster_config.auth_protocol,
+            &cluster_config.auth_password,
+            &cluster_config.security_level,
+            &cluster_config.priv_protocol,
+            &cluster_config.priv_password,
+            "1.3.6.1.2.1.1.1.0",
+        )
+        .await
+        .unwrap_or_default();
+
+        let vendor = detect_vendor(&sys_descr);
+
+        info!(
+            "init target={} sysDescr='{}' vendor={:?}",
+            ip, sys_descr, vendor
+        );
+
+        result.push(Target {
+            ip: ip.clone(),
+            vendor,
+        });
+    }
+
+    result
+}
+
+// 修改函数签名以接受配置参数
+async fn collect_single_target_with_config(
+    target: Target,
+    user: String,
+    auth_protocol: String,
+    auth_password: String,
+    security_level: String,
+    priv_protocol: Option<String>,
+    priv_password: Option<String>,
+    cluster_name: String,
+) -> Result<Vec<LogEvent>, String> {
+    match collect_lldp_from_switch(
+        &target,
+        &user,
+        &auth_protocol,
+        &auth_password,
+        &security_level,
+        &priv_protocol,
+        &priv_password,
+        &cluster_name,
+    )
+    .await
+    {
+        Ok((interfaces, neighbors)) => {
+            let logs = neighbors_to_logs(interfaces, neighbors, &cluster_name, &target.ip);
+            Ok(logs)
+        }
+        Err(e) => {
+            error!(
+                "SNMP LLDP scrape failed for target {} in cluster {}: {}",
+                target.ip, cluster_name, e
+            );
+            Err(e)
+        }
     }
 }
 
@@ -680,14 +729,14 @@ impl Default for SnmpSwitchLldpConfig {
             clusters: vec![SnmpClusterConfig {
                 name: "default".to_string(),
                 targets: vec!["127.0.0.1".to_string()],
+                user: "snmp_user".to_string(),
+                auth_protocol: "MD5".to_string(),
+                auth_password: "password".to_string(),
+                security_level: "authNoPriv".to_string(),
+                priv_protocol: None,
+                priv_password: None,
+                scrape_interval_secs: default_interval(),
             }],
-            user: "snmp_user".to_string(),
-            auth_protocol: "MD5".to_string(),
-            auth_password: "password".to_string(),
-            security_level: "authNoPriv".to_string(),
-            priv_protocol: None,
-            priv_password: None,
-            scrape_interval_secs: default_interval(),
         }
     }
 }
