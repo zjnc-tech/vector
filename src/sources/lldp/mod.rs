@@ -11,15 +11,19 @@
 )]
 mod ffi;
 
-use std::env;
 use chrono::Utc;
+use std::env;
 use std::time::Duration;
 
 use crate::{
     config::{SourceConfig, SourceContext, SourceOutput},
-    event::metric::{Metric, MetricKind, MetricTags, MetricValue},
+    event::{LogEvent, Value},
 };
+use vector_lib::config::LogNamespace;
 use vector_lib::configurable::configurable_component;
+use vector_lib::lookup::owned_value_path;
+use vector_lib::{config::DataType, schema};
+use vrl::value::Kind;
 
 use super::lldp::ffi::LldpError;
 
@@ -78,8 +82,8 @@ impl SourceConfig for LldpMetricsConfig {
                     _ = interface_interval.tick() => {
                         match ffi::get_lldp_interfaces_async().await {
                             Ok(interfaces) => {
-                                let interfaces_metrics = map_interfaces_to_metrics(interfaces, &config);
-                                if interface_out.send_batch(interfaces_metrics).await.is_err() {
+                                let interfaces_logs = map_interfaces_to_logs(interfaces, &config);
+                                if interface_out.send_batch(interfaces_logs).await.is_err() {
                                     warn!("Failed to send LLDP interface batch");
                                 }
                             }
@@ -98,11 +102,11 @@ impl SourceConfig for LldpMetricsConfig {
                     _ = link_interval.tick() => {
                         match ffi::get_lldp_neighbors_async().await {
                             Ok(neighbors) => {
-                                let (interfaces, links) = map_neighbors_to_interface_and_link(neighbors, &config);
-                                if link_out.send_batch(interfaces).await.is_err() {
+                                let (interfaces_logs, links_logs) = map_neighbors_to_interface_and_link_logs(neighbors, &config);
+                                if interface_out.send_batch(interfaces_logs).await.is_err() {
                                     warn!("Failed to send LLDP interface batch");
                                 }
-                                if link_out.send_batch(links).await.is_err() {
+                                if link_out.send_batch(links_logs).await.is_err() {
                                     warn!("Failed to send LLDP link batch");
                                 }
                             }
@@ -128,8 +132,86 @@ impl SourceConfig for LldpMetricsConfig {
             Ok(())
         }))
     }
-    fn outputs(&self, _: vector_lib::config::LogNamespace) -> Vec<SourceOutput> {
-        vec![SourceOutput::new_metrics()]
+
+    fn outputs(&self, _: LogNamespace) -> Vec<SourceOutput> {
+        let definition = schema::Definition::empty_legacy_namespace()
+            .with_event_field(
+                &owned_value_path!("timestamp"),
+                Kind::timestamp(),
+                Some("Time when the event was observed"),
+            )
+            .with_event_field(
+                &owned_value_path!("cluster"),
+                Kind::bytes(),
+                Some("Cluster identifier"),
+            )
+            .with_event_field(
+                &owned_value_path!("device"),
+                Kind::bytes(),
+                Some("Device name"),
+            )
+            .with_event_field(
+                &owned_value_path!("interface"),
+                Kind::bytes(),
+                Some("Interface name"),
+            )
+            .with_event_field(
+                &owned_value_path!("interface_normalized"),
+                Kind::bytes(),
+                Some("Normalized interface name"),
+            )
+            .with_event_field(
+                &owned_value_path!("out_band_ip"),
+                Kind::bytes(),
+                Some("Out-of-band IP address"),
+            )
+            .with_event_field(
+                &owned_value_path!("type"),
+                Kind::bytes(), // 修改为bytes以匹配实际实现
+                Some("Device type (leaf/spine/node)"),
+            )
+            .with_event_field(
+                &owned_value_path!("from_device"),
+                Kind::bytes(),
+                Some("Source device in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("from_interface"),
+                Kind::bytes(),
+                Some("Source interface in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("from_interface_normalized"),
+                Kind::bytes(),
+                Some("Normalized source interface name"),
+            )
+            .with_event_field(
+                &owned_value_path!("to_device"),
+                Kind::bytes(),
+                Some("Destination device in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("to_interface"),
+                Kind::bytes(),
+                Some("Destination interface in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("to_interface_normalized"),
+                Kind::bytes(),
+                Some("Normalized destination interface name"),
+            )
+            .with_event_field(
+                &owned_value_path!("log_type"),
+                Kind::bytes(),
+                Some("Type of log: interface or link"),
+            )
+            .with_event_field(
+                &owned_value_path!("level"),
+                Kind::bytes(), // 修改为bytes以匹配实际实现
+                Some("Connection level"),
+            );
+
+        vec![SourceOutput::new_maybe_logs(DataType::Log, definition)]
     }
 
     fn can_acknowledge(&self) -> bool {
@@ -137,90 +219,94 @@ impl SourceConfig for LldpMetricsConfig {
     }
 }
 
-pub fn map_interfaces_to_metrics(
-    interfaces: Vec<ffi::LldpInterface>,
-    config: &Config,
-) -> Vec<Metric> {
-    let now = Utc::now();
-    let mut metrics = Vec::new();
-
-    for interface in interfaces {
-        let mut tags = MetricTags::default();
-        tags.insert("cluster".to_string(), config.cluster.clone());
-        tags.insert("device".to_string(), interface.device_name.clone());
-        tags.insert("port".to_string(), interface.name.clone());
-        tags.insert("protocol".to_string(), "interface".to_string());
-        tags.insert("source".to_string(), "lldp".to_string());
-
-        metrics.push(
-            Metric::new(
-                "interface",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 1.0 },
-            )
-            .with_timestamp(Some(now))
-            .with_tags(Some(tags)),
-        );
-    }
-
-    metrics
+fn normalize_port_name(port: &str) -> String {
+    // 直接返回原始端口名称，不做任何处理
+    port.to_string()
 }
 
-pub fn map_neighbors_to_interface_and_link(
+pub fn map_interfaces_to_logs(
+    interfaces: Vec<ffi::LldpInterface>,
+    config: &Config,
+) -> Vec<LogEvent> {
+    let now = Utc::now();
+    let mut logs = Vec::new();
+
+    for interface in interfaces {
+        let normalized_port = normalize_port_name(&interface.name);
+        let mut log = LogEvent::default();
+        log.insert("timestamp", Value::Timestamp(now));
+        log.insert("cluster", Value::from(config.cluster.clone()));
+        log.insert("device", Value::from(interface.device_name.clone()));
+        log.insert("interface", Value::from(interface.name.clone()));
+        log.insert("interface_normalized", Value::from(normalized_port));
+
+        let node_ip = env::var("VECTOR_SELF_POD_HOSTIP").unwrap_or_else(|_| "unknown".to_string());
+
+        // 设置默认的IP和类型值
+        (log).insert("out_band_ip", Value::from(node_ip));
+        log.insert("type", Value::Integer(0)); // 默认类型为node
+        log.insert("log_type", Value::from("interface".to_string()));
+
+        logs.push(log);
+    }
+
+    logs
+}
+
+pub fn map_neighbors_to_interface_and_link_logs(
     neighbors: Vec<ffi::LldpNeighbor>,
     config: &Config,
-) -> (Vec<Metric>, Vec<Metric>) {
-    let mut interface_metrics = Vec::new();
-    let mut link_metrics = Vec::new();
+) -> (Vec<LogEvent>, Vec<LogEvent>) {
+    let mut interface_logs = Vec::new();
+    let mut link_logs = Vec::new();
 
     for neighbor in neighbors {
         let now = Utc::now();
 
-        // switch interface
-        let mut switch_tags = MetricTags::default();
-        switch_tags.insert("cluster".to_string(), config.cluster.clone());
-        switch_tags.insert("device".to_string(), neighbor.remote_device.clone());
-        switch_tags.insert("port".to_string(), neighbor.remote_port.clone());
-        switch_tags.insert("type".to_string(), "0");
-        switch_tags.insert("protocol".to_string(), "interface".to_string());
-        switch_tags.insert("source".to_string(), "lldp-collector".to_string());
+        // switch interface log
+        let mut interface_log = LogEvent::default();
+        let normalized_port = normalize_port_name(&neighbor.remote_port);
+        interface_log.insert("timestamp", Value::Timestamp(now));
+        interface_log.insert("cluster", Value::from(config.cluster.clone()));
+        interface_log.insert("device", Value::from(neighbor.remote_device.clone()));
+        interface_log.insert("interface", Value::from(neighbor.remote_port.clone()));
+        interface_log.insert("interface_normalized", Value::from(normalized_port));
+        interface_log.insert("log_type", Value::from("interface".to_string()));
 
-        let node_ip = env::var("NODE_IP")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let node_ip = env::var("VECTOR_SELF_POD_HOSTIP").unwrap_or_else(|_| "unknown".to_string());
 
-        switch_tags.insert("ip".to_string(), node_ip);
+        interface_log.insert("out_band_ip", Value::from(node_ip));
+        interface_log.insert("type", Value::Integer(0)); // 默认类型为node
 
-        interface_metrics.push(
-            Metric::new(
-                "interface",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 1.0 },
-            )
-            .with_timestamp(Some(now))
-            .with_tags(Some(switch_tags)),
+        interface_logs.push(interface_log);
+
+        // link log
+        let mut link_log = LogEvent::default();
+        let from_interface_normalized = normalize_port_name(&neighbor.local_interface);
+        let to_interface_normalized = normalize_port_name(&neighbor.remote_port);
+
+        link_log.insert("timestamp", Value::Timestamp(now));
+        link_log.insert("cluster", Value::from(config.cluster.clone()));
+        link_log.insert("level", Value::Integer(0));
+        link_log.insert("from_device", Value::from(neighbor.local_device.clone()));
+        link_log.insert(
+            "from_interface",
+            Value::from(neighbor.local_interface.clone()),
         );
-
-        // link
-        let mut link_tags = MetricTags::default();
-        link_tags.insert("cluster".to_string(), config.cluster.clone());
-        link_tags.insert("local_device".to_string(), neighbor.local_device.clone());
-        link_tags.insert("local_port".to_string(), neighbor.local_interface.clone());
-        link_tags.insert("remote_device".to_string(), neighbor.remote_device.clone());
-        link_tags.insert("remote_port".to_string(), neighbor.remote_port.clone());
-        link_tags.insert("level".to_string(), "0");
-        link_tags.insert("protocol".to_string(), "lldp".to_string());
-        link_tags.insert("source".to_string(), "lldp-collector".to_string());
-
-        link_metrics.push(
-            Metric::new(
-                "link",
-                MetricKind::Absolute,
-                MetricValue::Gauge { value: 1.0 },
-            )
-            .with_timestamp(Some(now))
-            .with_tags(Some(link_tags)),
+        (link_log).insert(
+            "from_interface_normalized",
+            Value::from(from_interface_normalized),
         );
+        link_log.insert("to_device", Value::from(neighbor.remote_device.clone()));
+        link_log.insert("to_interface", Value::from(neighbor.remote_port.clone()));
+        link_log.insert(
+            "to_interface_normalized",
+            Value::from(to_interface_normalized),
+        );
+        link_log.insert("log_type", Value::from("link".to_string()));
+
+        link_logs.push(link_log);
     }
 
-    (interface_metrics, link_metrics)
+    (interface_logs, link_logs)
 }
