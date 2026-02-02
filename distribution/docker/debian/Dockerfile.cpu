@@ -13,10 +13,19 @@ LABEL org.opencontainers.image.url="https://vector.dev"
 LABEL org.opencontainers.image.source="https://github.com/vectordotdev/vector"
 LABEL org.opencontainers.image.documentation="https://vector.dev/docs"
 
-# we want the latest versions of these
-# hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata systemd liblldpctl-dev && rm -rf /var/lib/apt/lists/*
+# 安装 LLDP 和 SNMP 客户端及依赖
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       tzdata \
+       systemd \
+       lldpd \
+       snmp \
+       libsnmp-dev \
+       liblldpctl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
+# 拷贝 Vector 可执行文件和默认配置
 COPY --from=builder /vector/bin/* /usr/local/bin/
 COPY --from=builder /vector/config/vector.yaml /etc/vector/vector.yaml
 
