@@ -12,7 +12,6 @@
 mod ffi;
 
 use chrono::Utc;
-use std::env;
 use std::time::Duration;
 
 use crate::{
@@ -42,17 +41,11 @@ pub struct LldpMetricsConfig {
 }
 
 const fn default_interface_scrape_interval() -> u64 {
-    30
+    60
 }
 
 const fn default_link_scrape_interval() -> u64 {
     60
-}
-
-#[derive(Clone)]
-pub struct Config {
-    pub node_name: String,
-    pub cluster: String,
 }
 
 impl_generate_config_from_default!(LldpMetricsConfig);
@@ -68,11 +61,6 @@ impl SourceConfig for LldpMetricsConfig {
         let shutdown = cx.shutdown.clone();
 
         Ok(Box::pin(async move {
-            let config = Config {
-                node_name: std::env::var("NODE_NAME").unwrap_or_else(|_| "unknown-node".into()),
-                cluster: std::env::var("CLUSTER_NAME").unwrap_or_else(|_| "unknown-cluster".into()),
-            };
-
             let mut interface_interval =
                 tokio::time::interval(Duration::from_secs(interface_scrape_secs));
             let mut link_interval = tokio::time::interval(Duration::from_secs(link_scrape_secs));
@@ -82,7 +70,7 @@ impl SourceConfig for LldpMetricsConfig {
                     _ = interface_interval.tick() => {
                         match ffi::get_lldp_interfaces_async().await {
                             Ok(interfaces) => {
-                                let interfaces_logs = map_interfaces_to_logs(interfaces, &config);
+                                let interfaces_logs = map_interfaces_to_logs(interfaces);
                                 if interface_out.send_batch(interfaces_logs).await.is_err() {
                                     warn!("Failed to send LLDP interface batch");
                                 }
@@ -102,7 +90,7 @@ impl SourceConfig for LldpMetricsConfig {
                     _ = link_interval.tick() => {
                         match ffi::get_lldp_neighbors_async().await {
                             Ok(neighbors) => {
-                                let (interfaces_logs, links_logs) = map_neighbors_to_interface_and_link_logs(neighbors, &config);
+                                let (interfaces_logs, links_logs) = map_neighbors_to_interface_and_link_logs(neighbors);
                                 if interface_out.send_batch(interfaces_logs).await.is_err() {
                                     warn!("Failed to send LLDP interface batch");
                                 }
@@ -141,11 +129,6 @@ impl SourceConfig for LldpMetricsConfig {
                 Some("Time when the event was observed"),
             )
             .with_event_field(
-                &owned_value_path!("cluster"),
-                Kind::bytes(),
-                Some("Cluster identifier"),
-            )
-            .with_event_field(
                 &owned_value_path!("device"),
                 Kind::bytes(),
                 Some("Device name"),
@@ -161,13 +144,8 @@ impl SourceConfig for LldpMetricsConfig {
                 Some("Normalized interface name"),
             )
             .with_event_field(
-                &owned_value_path!("out_band_ip"),
-                Kind::bytes(),
-                Some("Out-of-band IP address"),
-            )
-            .with_event_field(
                 &owned_value_path!("type"),
-                Kind::bytes(), // 修改为bytes以匹配实际实现
+                Kind::bytes(),
                 Some("Device type (leaf/spine/node)"),
             )
             .with_event_field(
@@ -207,7 +185,7 @@ impl SourceConfig for LldpMetricsConfig {
             )
             .with_event_field(
                 &owned_value_path!("level"),
-                Kind::bytes(), // 修改为bytes以匹配实际实现
+                Kind::bytes(),
                 Some("Connection level"),
             );
 
@@ -224,10 +202,7 @@ fn normalize_port_name(port: &str) -> String {
     port.to_string()
 }
 
-pub fn map_interfaces_to_logs(
-    interfaces: Vec<ffi::LldpInterface>,
-    config: &Config,
-) -> Vec<LogEvent> {
+pub fn map_interfaces_to_logs(interfaces: Vec<ffi::LldpInterface>) -> Vec<LogEvent> {
     let now = Utc::now();
     let mut logs = Vec::new();
 
@@ -235,15 +210,9 @@ pub fn map_interfaces_to_logs(
         let normalized_port = normalize_port_name(&interface.name);
         let mut log = LogEvent::default();
         log.insert("timestamp", Value::Timestamp(now));
-        log.insert("cluster", Value::from(config.cluster.clone()));
         log.insert("device", Value::from(interface.device_name.clone()));
         log.insert("interface", Value::from(interface.name.clone()));
         log.insert("interface_normalized", Value::from(normalized_port));
-
-        let node_ip = env::var("VECTOR_SELF_POD_HOSTIP").unwrap_or_else(|_| "unknown".to_string());
-
-        // 设置默认的IP和类型值
-        (log).insert("out_band_ip", Value::from(node_ip));
         log.insert("type", Value::Integer(0)); // 默认类型为node
         log.insert("log_type", Value::from("interface".to_string()));
 
@@ -255,7 +224,6 @@ pub fn map_interfaces_to_logs(
 
 pub fn map_neighbors_to_interface_and_link_logs(
     neighbors: Vec<ffi::LldpNeighbor>,
-    config: &Config,
 ) -> (Vec<LogEvent>, Vec<LogEvent>) {
     let mut interface_logs = Vec::new();
     let mut link_logs = Vec::new();
@@ -267,15 +235,10 @@ pub fn map_neighbors_to_interface_and_link_logs(
         let mut interface_log = LogEvent::default();
         let normalized_port = normalize_port_name(&neighbor.remote_port);
         interface_log.insert("timestamp", Value::Timestamp(now));
-        interface_log.insert("cluster", Value::from(config.cluster.clone()));
         interface_log.insert("device", Value::from(neighbor.remote_device.clone()));
         interface_log.insert("interface", Value::from(neighbor.remote_port.clone()));
         interface_log.insert("interface_normalized", Value::from(normalized_port));
         interface_log.insert("log_type", Value::from("interface".to_string()));
-
-        let node_ip = env::var("VECTOR_SELF_POD_HOSTIP").unwrap_or_else(|_| "unknown".to_string());
-
-        interface_log.insert("out_band_ip", Value::from(node_ip));
         interface_log.insert("type", Value::Integer(0)); // 默认类型为node
 
         interface_logs.push(interface_log);
@@ -286,7 +249,6 @@ pub fn map_neighbors_to_interface_and_link_logs(
         let to_interface_normalized = normalize_port_name(&neighbor.remote_port);
 
         link_log.insert("timestamp", Value::Timestamp(now));
-        link_log.insert("cluster", Value::from(config.cluster.clone()));
         link_log.insert("level", Value::Integer(0));
         link_log.insert("from_device", Value::from(neighbor.local_device.clone()));
         link_log.insert(
