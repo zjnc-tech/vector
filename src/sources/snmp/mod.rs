@@ -166,9 +166,14 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                 Some("Device name"),
             )
             .with_event_field(
-                &owned_value_path!("port"),
+                &owned_value_path!("interface"),
                 Kind::bytes(),
-                Some("Device port"),
+                Some("Interface name"),
+            )
+            .with_event_field(
+                &owned_value_path!("interface_normalized"),
+                Kind::bytes(),
+                Some("Normalized interface name"),
             )
             .with_event_field(
                 &owned_value_path!("out_band_ip"),
@@ -177,8 +182,8 @@ impl SourceConfig for SnmpSwitchLldpConfig {
             )
             .with_event_field(
                 &owned_value_path!("type"),
-                Kind::integer(),
-                Some("Device type (0=node, 1=leaf, 2=spine)"),
+                Kind::bytes(),
+                Some("Device type (leaf/spine/node)"),
             )
             .with_event_field(
                 &owned_value_path!("from_device"),
@@ -186,9 +191,14 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                 Some("Source device in connection"),
             )
             .with_event_field(
-                &owned_value_path!("from_port"),
+                &owned_value_path!("from_interface"),
                 Kind::bytes(),
-                Some("Source port in connection"),
+                Some("Source interface in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("from_interface_normalized"),
+                Kind::bytes(),
+                Some("Normalized source interface name"),
             )
             .with_event_field(
                 &owned_value_path!("to_device"),
@@ -196,14 +206,24 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                 Some("Destination device in connection"),
             )
             .with_event_field(
-                &owned_value_path!("to_port"),
+                &owned_value_path!("to_interface"),
                 Kind::bytes(),
-                Some("Destination port in connection"),
+                Some("Destination interface in connection"),
+            )
+            .with_event_field(
+                &owned_value_path!("to_interface_normalized"),
+                Kind::bytes(),
+                Some("Normalized destination interface name"),
             )
             .with_event_field(
                 &owned_value_path!("log_type"),
                 Kind::bytes(),
                 Some("Type of log: interface or link"),
+            )
+            .with_event_field(
+                &owned_value_path!("level"),
+                Kind::bytes(),
+                Some("Connection level"),
             );
 
         vec![SourceOutput::new_maybe_logs(DataType::Log, definition)]
@@ -636,9 +656,9 @@ fn normalize_port_name(port: &str) -> String {
 
 fn device_role(name: &str) -> &'static str {
     let n = name.to_ascii_uppercase();
-    if n.contains("RASW") || n.contains("LEAF") {
+    if n.contains("RASW")|| n.contains("EHSW ") || n.contains("LEAF") {
         "leaf"
-    } else if n.contains("RDSW") || n.contains("SPINE") {
+    } else if n.contains("RDSW")|| n.contains("EDSW ") || n.contains("SPINE") {
         "spine"
     } else {
         "node"
