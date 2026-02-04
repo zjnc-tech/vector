@@ -111,19 +111,19 @@ impl SourceConfig for SnmpSwitchLldpConfig {
 
             // 为每个集群启动一个独立的任务
             for cluster_config in clusters {
-                let mut out_clone = out.clone();  // 需要可变引用以发送批次
+                let mut out_clone = out.clone(); // 需要可变引用以发送批次
                 let shutdown_clone = shutdown.clone();
 
                 let handle = tokio::spawn(async move {
                     let mut cluster_shutdown = shutdown_clone;
-                    
+
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(cluster_config.scrape_interval_secs)) => {
                                 let cluster_logs = collect_cluster_data_with_config(
                                     &cluster_config,
                                 ).await;
-                                
+
                                 if let Err(e) = out_clone.send_batch(cluster_logs).await {
                                     error!("failed to send cluster {} logs: {}", cluster_config.name, e);
                                 }
@@ -656,9 +656,9 @@ fn normalize_port_name(port: &str) -> String {
 
 fn device_role(name: &str) -> &'static str {
     let n = name.to_ascii_uppercase();
-    if n.contains("RASW")|| n.contains("EHSW ") || n.contains("LEAF") {
+    if n.contains("RASW") || n.contains("EHSW ") || n.contains("LEAF") {
         "leaf"
-    } else if n.contains("RDSW")|| n.contains("EDSW ") || n.contains("SPINE") {
+    } else if n.contains("RDSW") || n.contains("EDSW ") || n.contains("SPINE") {
         "spine"
     } else {
         "node"
@@ -694,6 +694,15 @@ fn neighbors_to_logs(
 
     // 创建link日志 - 存储连接关系，包含from-name、from-port和remote-name、remote-port字段
     for n in neighbors {
+        // 如果本端设备名以"O"开头或以"RMSW"开头，则舍弃数据
+        if n.local_device.starts_with('O')
+            || n.local_device.starts_with('o')
+            || n.local_device.starts_with("RMSW")
+            || n.local_device.starts_with("rmsw")
+        {
+            continue;
+        }
+
         let local_role = device_role(&n.local_device);
         let remote_role = device_role(&n.remote_device);
 
