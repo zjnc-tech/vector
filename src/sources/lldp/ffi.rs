@@ -528,6 +528,12 @@ pub async fn get_lldp_neighbors_async() -> Result<Vec<LldpNeighbor>, LldpError> 
 /// 使用lldptool命令行工具获取LLDP接口信息
 async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpError> {
     tokio::task::spawn_blocking(|| {
+        // 首先检查lldptool是否可用
+        if !is_lldptool_available() {
+            warn!("lldptool not found, using basic interface discovery");
+            return get_basic_interfaces();
+        }
+
         let mut all_interfaces = Vec::new();
         let local_device_name = get_local_device_name().unwrap_or_default();
 
@@ -575,6 +581,12 @@ async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpEr
 /// 使用lldptool命令行工具获取LLDP邻居信息
 async fn get_lldp_neighbors_via_lldptool() -> Result<Vec<LldpNeighbor>, LldpError> {
     tokio::task::spawn_blocking(|| {
+        // 首先检查lldptool是否可用
+        if !is_lldptool_available() {
+            warn!("lldptool not found, returning empty neighbor list");
+            return Ok(Vec::new());
+        }
+
         let local_device_name = get_local_device_name().unwrap_or_default();
         let mut all_neighbors = Vec::new();
 
@@ -590,6 +602,51 @@ async fn get_lldp_neighbors_via_lldptool() -> Result<Vec<LldpNeighbor>, LldpErro
     })
     .await
     .map_err(|_| LldpError::ThreadJoinFailed)?
+}
+
+/// 检查lldptool命令是否可用
+fn is_lldptool_available() -> bool {
+    let check_result = Command::new("which")
+        .arg("lldptool")
+        .output();
+    
+    if let Ok(output) = check_result {
+        output.status.success()
+    } else {
+        false
+    }
+}
+
+/// 获取基本的网络接口信息（当lldptool不可用时）
+fn get_basic_interfaces() -> Result<Vec<LldpInterface>, LldpError> {
+    let local_device_name = get_local_device_name().unwrap_or_default();
+    let mut interfaces = Vec::new();
+    
+    // 使用常见的接口名称
+    let common_interfaces = ["eth0", "enp0s3", "ens33", "wlan0"];
+    
+    for interface in &common_interfaces {
+        // 简单检查接口是否存在（通过尝试读取/proc/net/dev）
+        let proc_path = format!("/proc/net/dev");
+        if let Ok(content) = std::fs::read_to_string(&proc_path) {
+            if content.contains(interface) {
+                interfaces.push(LldpInterface {
+                    name: interface.to_string(),
+                    device_name: local_device_name.clone(),
+                });
+            }
+        }
+    }
+    
+    // 如果没有找到常见接口，至少返回一个默认接口
+    if interfaces.is_empty() {
+        interfaces.push(LldpInterface {
+            name: "unknown".to_string(),
+            device_name: local_device_name,
+        });
+    }
+    
+    Ok(interfaces)
 }
 
 /// 从lldptool输出行中提取接口名称
@@ -644,6 +701,12 @@ fn discover_interfaces_via_lldptool_commands(local_device_name: String) -> Resul
 /// 获取单个接口的LLDP邻居信息
 fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>, LldpError> {
     let mut neighbors = Vec::new();
+
+    // 首先检查lldptool是否可用
+    if !is_lldptool_available() {
+        warn!("lldptool not found, skipping LLDP neighbor discovery for interface {}", interface);
+        return Ok(neighbors);
+    }
 
     // 执行命令: lldptool -tni <interface>
     let output = Command::new("lldptool")
