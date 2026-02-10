@@ -274,6 +274,16 @@ impl LldpHandle {
             if let Some(ref funcs) = LLDP_FUNCTIONS {
                 let interfaces = (funcs.lldpctl_get_interfaces)(self.conn);
                 if interfaces.is_null() {
+                    // 检查是否是socket连接错误导致的接口获取失败
+                    let err_msg = get_last_error_message();
+                    if err_msg.contains("unable to connect to socket") 
+                        || err_msg.contains("No such file or directory") 
+                        || err_msg.contains("Connection refused") {
+                        warn!("LLDP socket connection failed when fetching interfaces: {}, falling back to command line mode", err_msg);
+                        return Err(LldpError::LibraryNotAvailable(
+                            format!("LLDP socket unavailable when fetching interfaces: {}", err_msg)
+                        ));
+                    }
                     return Err(LldpError::InterfaceFetchFailed);
                 }
 
@@ -337,6 +347,16 @@ impl LldpHandle {
             if let Some(ref funcs) = LLDP_FUNCTIONS {
                 let interface_list = (funcs.lldpctl_get_interfaces)(self.conn);
                 if interface_list.is_null() {
+                    // 检查是否是socket连接错误导致的接口获取失败
+                    let err_msg = get_last_error_message();
+                    if err_msg.contains("unable to connect to socket") 
+                        || err_msg.contains("No such file or directory") 
+                        || err_msg.contains("Connection refused") {
+                        warn!("LLDP socket connection failed when fetching neighbors: {}, falling back to command line mode", err_msg);
+                        return Err(LldpError::LibraryNotAvailable(
+                            format!("LLDP socket unavailable when fetching neighbors: {}", err_msg)
+                        ));
+                    }
                     return Err(LldpError::InterfaceFetchFailed);
                 }
                 let interface_list = AtomGuard::new(interface_list);
