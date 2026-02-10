@@ -528,17 +528,42 @@ pub async fn get_lldp_neighbors_async() -> Result<Vec<LldpNeighbor>, LldpError> 
 /// 使用lldptool命令行工具获取LLDP接口信息
 async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpError> {
     tokio::task::spawn_blocking(|| {
-        // 获取所有网络接口
-        let interfaces = get_network_interfaces()?;
         let mut all_interfaces = Vec::new();
         let local_device_name = get_local_device_name().unwrap_or_default();
 
-        for interface in interfaces {
-            // 对于每个接口，创建一个本地接口记录
-            all_interfaces.push(LldpInterface {
-                name: interface.clone(),
-                device_name: local_device_name.clone(),
-            });
+        // 使用lldptool直接获取接口信息
+        // 方法1: 尝试使用 lldptool -i any -p 获取所有LLDP接口
+        let lldptool_result = Command::new("lldptool")
+            .args(["-i", "any", "-p"])
+            .output();
+
+        if let Ok(output) = lldptool_result {
+            if output.status.success() {
+                let stdout = str::from_utf8(&output.stdout)
+                    .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in lldptool output".to_string()))?;
+                
+                // 解析lldptool输出获取接口列表
+                for line in stdout.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with("Interface") {
+                        continue;
+                    }
+                    
+                    // 提取接口名称
+                    if let Some(interface_name) = extract_interface_from_lldptool_line(line) {
+                        all_interfaces.push(LldpInterface {
+                            name: interface_name,
+                            device_name: local_device_name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 如果lldptool -p失败或没有找到接口，使用备用方法
+        if all_interfaces.is_empty() {
+            warn!("No LLDP interfaces found via lldptool -p, using alternative discovery");
+            all_interfaces = discover_interfaces_via_lldptool_commands(local_device_name)?;
         }
 
         Ok(all_interfaces)
@@ -550,12 +575,14 @@ async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpEr
 /// 使用lldptool命令行工具获取LLDP邻居信息
 async fn get_lldp_neighbors_via_lldptool() -> Result<Vec<LldpNeighbor>, LldpError> {
     tokio::task::spawn_blocking(|| {
-        // 获取所有网络接口
-        let interfaces = get_network_interfaces()?;
+        let local_device_name = get_local_device_name().unwrap_or_default();
         let mut all_neighbors = Vec::new();
 
-        for interface in interfaces {
-            let neighbors = get_lldp_neighbors_for_interface(&interface)?;
+        // 使用lldptool发现接口并获取邻居信息
+        let interfaces = discover_interfaces_via_lldptool_commands(local_device_name)?;
+        
+        for interface_info in interfaces {
+            let neighbors = get_lldp_neighbors_for_interface(&interface_info.name)?;
             all_neighbors.extend(neighbors);
         }
 
@@ -565,42 +592,52 @@ async fn get_lldp_neighbors_via_lldptool() -> Result<Vec<LldpNeighbor>, LldpErro
     .map_err(|_| LldpError::ThreadJoinFailed)?
 }
 
-/// 获取系统网络接口列表
-fn get_network_interfaces() -> Result<Vec<String>, LldpError> {
-    // 使用ip命令获取接口列表
-    let output = Command::new("ip")
-        .args(["link", "show"])
-        .output()
-        .map_err(|e| LldpError::LibraryNotAvailable(format!("Failed to execute ip command: {}", e)))?;
-
-    if !output.status.success() {
-        return Err(LldpError::LibraryNotAvailable(
-            "ip command failed".to_string(),
-        ));
+/// 从lldptool输出行中提取接口名称
+fn extract_interface_from_lldptool_line(line: &str) -> Option<String> {
+    // lldptool -p 输出格式通常是: "eth0"
+    let interface = line.trim();
+    if !interface.is_empty() 
+        && interface != "lo" 
+        && !interface.starts_with("docker")
+        && !interface.starts_with("veth")
+        && !interface.starts_with("br-") {
+        Some(interface.to_string())
+    } else {
+        None
     }
+}
 
-    let stdout = str::from_utf8(&output.stdout)
-        .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in ip output".to_string()))?;
-
+/// 通过lldptool命令发现接口
+fn discover_interfaces_via_lldptool_commands(local_device_name: String) -> Result<Vec<LldpInterface>, LldpError> {
     let mut interfaces = Vec::new();
-    for line in stdout.lines() {
-        // 匹配接口行，例如: "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000"
-        if let Some(colon_pos) = line.find(':') {
-            let line_after_colon = &line[colon_pos + 1..];
-            if let Some(space_pos) = line_after_colon.find(' ') {
-                let interface_name = line_after_colon[..space_pos].trim();
-                // 过滤掉loopback和虚拟接口
-                if !interface_name.is_empty() 
-                    && interface_name != "lo" 
-                    && !interface_name.starts_with("docker")
-                    && !interface_name.starts_with("veth")
-                    && !interface_name.starts_with("br-") {
-                    interfaces.push(interface_name.to_string());
-                }
+    
+    // 方法1: 尝试常见的网络接口名称
+    let common_interfaces = ["eth0", "eth1", "enp0s3", "enp0s8", "ens33", "wlan0"];
+    
+    for interface in &common_interfaces {
+        // 检查接口是否存在且启用了LLDP
+        let check_result = Command::new("lldptool")
+            .args(["-t", "-i", interface])
+            .output();
+            
+        if let Ok(output) = check_result {
+            if output.status.success() {
+                interfaces.push(LldpInterface {
+                    name: interface.to_string(),
+                    device_name: local_device_name.clone(),
+                });
             }
         }
     }
-
+    
+    // 如果还是没有找到接口，至少返回本地设备信息
+    if interfaces.is_empty() {
+        interfaces.push(LldpInterface {
+            name: "unknown".to_string(),
+            device_name: local_device_name,
+        });
+    }
+    
     Ok(interfaces)
 }
 
