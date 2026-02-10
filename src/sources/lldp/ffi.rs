@@ -466,12 +466,23 @@ fn get_string_property(atom: *mut std::os::raw::c_void, key: u32) -> Result<Stri
 }
 
 pub async fn get_lldp_interfaces_async() -> Result<Vec<LldpInterface>, LldpError> {
-    tokio::task::spawn_blocking(|| {
+    // 首先尝试使用liblldpctl库
+    let library_result = tokio::task::spawn_blocking(|| {
         let handle = LldpHandle::new()?;
         handle.get_interfaces()
     })
     .await
-    .map_err(|_| LldpError::ThreadJoinFailed)?
+    .map_err(|_| LldpError::ThreadJoinFailed)?;
+
+    match library_result {
+        Ok(interfaces) => Ok(interfaces),
+        Err(LldpError::LibraryNotAvailable(_)) => {
+            // 如果库不可用，回退到lldptool命令行工具
+            warn!("LLDP library not available for interfaces, falling back to lldptool");
+            get_lldp_interfaces_via_lldptool().await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn get_lldp_neighbors_async() -> Result<Vec<LldpNeighbor>, LldpError> {
@@ -492,6 +503,28 @@ pub async fn get_lldp_neighbors_async() -> Result<Vec<LldpNeighbor>, LldpError> 
         }
         Err(e) => Err(e),
     }
+}
+
+/// 使用lldptool命令行工具获取LLDP接口信息
+async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpError> {
+    tokio::task::spawn_blocking(|| {
+        // 获取所有网络接口
+        let interfaces = get_network_interfaces()?;
+        let mut all_interfaces = Vec::new();
+        let local_device_name = get_local_device_name().unwrap_or_default();
+
+        for interface in interfaces {
+            // 对于每个接口，创建一个本地接口记录
+            all_interfaces.push(LldpInterface {
+                name: interface.clone(),
+                device_name: local_device_name.clone(),
+            });
+        }
+
+        Ok(all_interfaces)
+    })
+    .await
+    .map_err(|_| LldpError::ThreadJoinFailed)?
 }
 
 /// 使用lldptool命令行工具获取LLDP邻居信息
