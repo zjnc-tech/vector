@@ -539,30 +539,49 @@ async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpEr
 
         // 使用lldptool直接获取接口信息
         // 方法1: 尝试使用 lldptool -i any -p 获取所有LLDP接口
+        warn!(message = "Executing lldptool -i any -p command");
         let lldptool_result = Command::new("lldptool")
             .args(["-i", "any", "-p"])
             .output();
 
-        if let Ok(output) = lldptool_result {
-            if output.status.success() {
-                let stdout = str::from_utf8(&output.stdout)
-                    .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in lldptool output".to_string()))?;
-                
-                // 解析lldptool输出获取接口列表
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with("Interface") {
-                        continue;
-                    }
+        match lldptool_result {
+            Ok(output) => {
+                warn!(message = "lldptool command completed",
+                       success = output.status.success(),
+                       exit_code = output.status.code().unwrap_or(-1));
+                        
+                if output.status.success() {
+                    let stdout = str::from_utf8(&output.stdout)
+                        .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in lldptool output".to_string()))?;
+
+                    warn!(message = "lldptool output", raw_output = stdout);
                     
-                    // 提取接口名称
-                    if let Some(interface_name) = extract_interface_from_lldptool_line(line) {
-                        all_interfaces.push(LldpInterface {
-                            name: interface_name,
-                            device_name: local_device_name.clone(),
-                        });
+                    // 解析lldptool输出获取接口列表
+                    for line in stdout.lines() {
+                        warn!(message = "Processing lldptool output line", line = line);
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with("Interface") {
+                            warn!(message = "Skipping header or empty line");
+                            continue;
+                        }
+                        
+                        // 提取接口名称
+                        if let Some(interface_name) = extract_interface_from_lldptool_line(line) {
+                            debug!(message = "Adding interface to result", interface = &interface_name);
+                            all_interfaces.push(LldpInterface {
+                                name: interface_name,
+                                device_name: local_device_name.clone(),
+                            });
+                        }
                     }
+                    warn!(message = "Processed all lldptool lines", interface_count = all_interfaces.len());
+                } else {
+                    warn!(message = "lldptool command failed", 
+                          stderr = String::from_utf8_lossy(&output.stderr).trim());
                 }
+            }
+            Err(e) => {
+                warn!(message = "Failed to execute lldptool command", error = e.to_string());
             }
         }
 
@@ -651,17 +670,44 @@ fn get_basic_interfaces() -> Result<Vec<LldpInterface>, LldpError> {
 
 /// 从lldptool输出行中提取接口名称
 fn extract_interface_from_lldptool_line(line: &str) -> Option<String> {
+    // 记录原始输入用于调试
+    debug!(message = "Processing LLDP interface line", raw_line = line);
+    
     // lldptool -p 输出格式通常是: "eth0"
     let interface = line.trim();
-    if !interface.is_empty() 
-        && interface != "lo" 
-        && !interface.starts_with("docker")
-        && !interface.starts_with("veth")
-        && !interface.starts_with("br-") {
-        Some(interface.to_string())
-    } else {
-        None
+    
+    // 记录处理后的接口名称
+    debug!(message = "Trimmed interface name", trimmed_name = interface);
+    
+    if interface.is_empty() {
+        debug!(message = "Skipping empty interface line");
+        return None;
     }
+    
+    // 过滤掉不需要的虚拟接口
+    if interface == "lo" {
+        debug!(message = "Skipping loopback interface");
+        return None;
+    }
+    
+    if interface.starts_with("docker") {
+        debug!(message = "Skipping docker interface", interface = interface);
+        return None;
+    }
+    
+    if interface.starts_with("veth") {
+        debug!(message = "Skipping veth interface", interface = interface);
+        return None;
+    }
+    
+    if interface.starts_with("br-") {
+        debug!(message = "Skipping bridge interface", interface = interface);
+        return None;
+    }
+    
+    // 记录最终接受的接口名称
+    debug!(message = "Accepting interface", final_interface = interface);
+    Some(interface.to_string())
 }
 
 /// 通过lldptool命令发现接口
