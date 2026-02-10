@@ -656,9 +656,9 @@ fn normalize_port_name(port: &str) -> String {
 
 fn device_role(name: &str) -> &'static str {
     let n = name.to_ascii_uppercase();
-    if n.contains("RASW") || n.contains("EHSW ") || n.contains("LEAF") {
+    if n.contains("RASW") || n.contains("EHSW") || n.contains("LEAF") {
         "leaf"
-    } else if n.contains("RDSW") || n.contains("EDSW ") || n.contains("SPINE") {
+    } else if n.contains("RDSW") || n.contains("EDSW") || n.contains("SPINE") {
         "spine"
     } else {
         "node"
