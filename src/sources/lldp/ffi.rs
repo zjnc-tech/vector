@@ -628,8 +628,6 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
         .map_err(|e| LldpError::LibraryNotAvailable(format!("Failed to execute lldptool: {}", e)))?;
 
     if !output.status.success() {
-        // lldptool可能未安装或接口不支持LLDP
-        let stderr = String::from_utf8_lossy(&output.stderr);
         warn!(message = "lldptool stdout for failed interface", interface = interface, stdout = String::from_utf8_lossy(&output.stdout).as_ref());
         return Ok(neighbors);
     }
