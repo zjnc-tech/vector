@@ -1,6 +1,7 @@
 use std::error::Error as StdError;
 use std::ffi::CStr;
 use std::fmt;
+use std::fs;
 use std::process::Command;
 use std::ptr;
 use std::str;
@@ -111,7 +112,7 @@ static mut LLDP_FUNCTIONS: Option<LldpFunctions> = None;
 /// 获取最后一次系统错误消息
 fn get_last_error_message() -> String {
     use std::io;
-    
+
     // 尝试获取系统错误信息
     if let Some(err) = io::Error::last_os_error().raw_os_error() {
         match err {
@@ -243,8 +244,8 @@ impl LldpHandle {
                 if conn.is_null() {
                     // 检查是否是socket连接错误
                     let err_msg = get_last_error_message();
-                    if err_msg.contains("unable to connect to socket") 
-                        || err_msg.contains("No such file or directory") 
+                    if err_msg.contains("unable to connect to socket")
+                        || err_msg.contains("No such file or directory")
                         || err_msg.contains("Connection refused") {
                         warn!("LLDP socket connection failed: {}, falling back to command line mode", err_msg);
                         return Err(LldpError::LibraryNotAvailable(
@@ -276,8 +277,8 @@ impl LldpHandle {
                 if interfaces.is_null() {
                     // 检查是否是socket连接错误导致的接口获取失败
                     let err_msg = get_last_error_message();
-                    if err_msg.contains("unable to connect to socket") 
-                        || err_msg.contains("No such file or directory") 
+                    if err_msg.contains("unable to connect to socket")
+                        || err_msg.contains("No such file or directory")
                         || err_msg.contains("Connection refused") {
                         warn!("LLDP socket connection failed when fetching interfaces: {}, falling back to command line mode", err_msg);
                         return Err(LldpError::LibraryNotAvailable(
@@ -349,8 +350,8 @@ impl LldpHandle {
                 if interface_list.is_null() {
                     // 检查是否是socket连接错误导致的接口获取失败
                     let err_msg = get_last_error_message();
-                    if err_msg.contains("unable to connect to socket") 
-                        || err_msg.contains("No such file or directory") 
+                    if err_msg.contains("unable to connect to socket")
+                        || err_msg.contains("No such file or directory")
                         || err_msg.contains("Connection refused") {
                         warn!("LLDP socket connection failed when fetching neighbors: {}, falling back to command line mode", err_msg);
                         return Err(LldpError::LibraryNotAvailable(
@@ -528,89 +529,22 @@ pub async fn get_lldp_neighbors_async() -> Result<Vec<LldpNeighbor>, LldpError> 
 /// 使用lldptool命令行工具获取LLDP接口信息
 async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpError> {
     tokio::task::spawn_blocking(|| {
-        // 首先检查lldptool是否可用
-        if !is_lldptool_available() {
-            warn!("lldptool not found, using basic interface discovery");
-            return get_basic_interfaces();
-        }
-
         let mut all_interfaces = Vec::new();
         let local_device_name = get_local_device_name().unwrap_or_default();
 
-        // 使用更好的方法获取真实接口名称
-        // 方法1: 使用 ip link show 获取接口列表
-        warn!(message = "Getting interface list via ip link show");
-        let ip_link_result = Command::new("ip")
-            .args(["link", "show"])
-            .output();
+        // 使用/sys/class/net方式获取真实接口名称
+        warn!(message = "Getting interface list via /sys/class/net");
+        let interfaces = get_interfaces_from_sys_class_net();
+        warn!(message = "Found interfaces from sysfs", count = interfaces.len(), interfaces = ?interfaces);
 
-        match ip_link_result {
-            Ok(output) => {
-                if output.status.success() {
-                    let stdout = str::from_utf8(&output.stdout)
-                        .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in ip link output".to_string()))?;
-                    
-                    warn!(message = "ip link show output", raw_output = stdout);
-                    
-                    // 解析ip link show输出获取接口列表
-                    let interfaces = parse_ip_link_output(stdout);
-                    warn!(message = "Found physical interfaces", count = interfaces.len(), interfaces = ?interfaces);
-                    
-                    // 对每个接口执行lldptool检查
-                    for interface in interfaces {
-                        warn!(message = "Checking LLDP status for interface", interface = &interface);
-                        
-                        let lldptool_check = Command::new("lldptool")
-                            .args(["-t", "-n", "-i", &interface])
-                            .output();
-                        
-                        match lldptool_check {
-                            Ok(check_output) => {
-                                if check_output.status.success() {
-                                    let check_stdout = str::from_utf8(&check_output.stdout)
-                                        .unwrap_or("");
-                                    
-                                    // 检查是否有有效的LLDP信息
-                                    if check_stdout.contains("Chassis ID") || 
-                                       check_stdout.contains("Port ID") ||
-                                       check_stdout.contains("TLV") {
-                                        warn!(message = "Interface has LLDP information", interface = &interface);
-                                        all_interfaces.push(LldpInterface {
-                                            name: interface,
-                                            device_name: local_device_name.clone(),
-                                        });
-                                    } else {
-                                        warn!(message = "Interface has no LLDP information", interface = &interface);
-                                    }
-                                } else {
-                                    warn!(message = "LLDP check failed for interface", 
-                                           interface = &interface,
-                                           stderr = String::from_utf8_lossy(&check_output.stderr).trim());
-                                }
-                            }
-                            Err(e) => {
-                                warn!(message = "Failed to check LLDP for interface", 
-                                       interface = &interface,
-                                       error = e.to_string());
-                            }
-                        }
-                    }
-                } else {
-                    warn!(message = "ip link show command failed", 
-                          stderr = String::from_utf8_lossy(&output.stderr).trim());
-                }
-            }
-            Err(e) => {
-                warn!(message = "Failed to execute ip link show", error = e.to_string());
-            }
+        // 直接使用所有找到的物理接口，无需额外的LLDP检查
+        for interface in interfaces {
+            warn!(message = "Adding interface to LLDP result", interface = &interface);
+            all_interfaces.push(LldpInterface {
+                name: interface,
+                device_name: local_device_name.clone(),
+            });
         }
-
-        // 如果lldptool -p失败或没有找到接口，使用备用方法
-        if all_interfaces.is_empty() {
-            warn!("No LLDP interfaces found via lldptool -p, using alternative discovery");
-            all_interfaces = discover_interfaces_via_lldptool_commands(local_device_name)?;
-        }
-
         Ok(all_interfaces)
     })
     .await
@@ -619,20 +553,21 @@ async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpEr
 
 /// 使用lldptool命令行工具获取LLDP邻居信息
 async fn get_lldp_neighbors_via_lldptool() -> Result<Vec<LldpNeighbor>, LldpError> {
-    tokio::task::spawn_blocking(|| {
+    // 首先获取本地接口列表
+    let local_interfaces = get_lldp_interfaces_via_lldptool().await?;
+
+    tokio::task::spawn_blocking(move || {
         // 首先检查lldptool是否可用
         if !is_lldptool_available() {
             warn!("lldptool not found, returning empty neighbor list");
             return Ok(Vec::new());
         }
 
-        let local_device_name = get_local_device_name().unwrap_or_default();
         let mut all_neighbors = Vec::new();
 
-        // 使用lldptool发现接口并获取邻居信息
-        let interfaces = discover_interfaces_via_lldptool_commands(local_device_name)?;
-        
-        for interface_info in interfaces {
+        // 对每个本地接口获取邻居信息
+        for interface_info in local_interfaces {
+            warn!(message = "Getting LLDP neighbors for interface", interface = &interface_info.name);
             let neighbors = get_lldp_neighbors_for_interface(&interface_info.name)?;
             all_neighbors.extend(neighbors);
         }
@@ -648,7 +583,7 @@ fn is_lldptool_available() -> bool {
     let check_result = Command::new("which")
         .arg("lldptool")
         .output();
-    
+
     if let Ok(output) = check_result {
         output.status.success()
     } else {
@@ -656,65 +591,29 @@ fn is_lldptool_available() -> bool {
     }
 }
 
-/// 获取基本的网络接口信息（当lldptool不可用时）
-fn get_basic_interfaces() -> Result<Vec<LldpInterface>, LldpError> {
-    let local_device_name = get_local_device_name().unwrap_or_default();
+/// 从/sys/class/net获取网络接口列表
+fn get_interfaces_from_sys_class_net() -> Vec<String> {
     let mut interfaces = Vec::new();
-    
-    // 使用常见的接口名称
-    let common_interfaces = ["eth0", "enp0s3", "ens33", "wlan0"];
-    
-    for interface in &common_interfaces {
-        // 简单检查接口是否存在（通过尝试读取/proc/net/dev）
-        let proc_path = format!("/proc/net/dev");
-        if let Ok(content) = std::fs::read_to_string(&proc_path) {
-            if content.contains(interface) {
-                interfaces.push(LldpInterface {
-                    name: interface.to_string(),
-                    device_name: local_device_name.clone(),
-                });
-            }
-        }
-    }
-    
-    // 如果没有找到常见接口，至少返回一个默认接口
-    if interfaces.is_empty() {
-        interfaces.push(LldpInterface {
-            name: "unknown".to_string(),
-            device_name: local_device_name,
-        });
-    }
-    
-    Ok(interfaces)
-}
 
-/// 解析ip link show输出，提取物理网络接口名称
-fn parse_ip_link_output(output: &str) -> Vec<String> {
-    let mut interfaces = Vec::new();
-    
-    for line in output.lines() {
-        // ip link show的输出格式通常是: "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000"
-        // 或者: "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000"
-        
-        if let Some(colon_pos) = line.find(':') {
-            let after_number = &line[colon_pos + 1..];
-            if let Some(colon_pos2) = after_number.find(':') {
-                let interface_name = after_number[..colon_pos2].trim();
-                
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
                 // 过滤掉不需要的接口
-                if !interface_name.is_empty() 
-                    && interface_name != "lo" 
-                    && !interface_name.starts_with("docker")
-                    && !interface_name.starts_with("veth")
-                    && !interface_name.starts_with("br-")
-                    && !interface_name.starts_with("virbr")
-                    && !interface_name.starts_with("vnet") {
-                    interfaces.push(interface_name.to_string());
+                if name != "lo"
+                    && !name.starts_with("docker")
+                    && !name.starts_with("veth")
+                    && !name.starts_with("br-")
+                    && !name.starts_with("virbr")
+                    && !name.starts_with("vnet")
+                    && !name.starts_with("bond")  // bond接口通常也是虚拟的
+                    && !name.starts_with("tun")   // tun/tap接口
+                    && !name.starts_with("tap") {
+                    interfaces.push(name.to_string());
                 }
             }
         }
     }
-    
+
     interfaces
 }
 
@@ -722,76 +621,42 @@ fn parse_ip_link_output(output: &str) -> Vec<String> {
 fn extract_interface_from_lldptool_line(line: &str) -> Option<String> {
     // 记录原始输入用于调试
     debug!(message = "Processing LLDP interface line", raw_line = line);
-    
+
     // lldptool -p 输出格式通常是: "eth0"
     let interface = line.trim();
-    
+
     // 记录处理后的接口名称
     debug!(message = "Trimmed interface name", trimmed_name = interface);
-    
+
     if interface.is_empty() {
         debug!(message = "Skipping empty interface line");
         return None;
     }
-    
+
     // 过滤掉不需要的虚拟接口
     if interface == "lo" {
         debug!(message = "Skipping loopback interface");
         return None;
     }
-    
+
     if interface.starts_with("docker") {
         debug!(message = "Skipping docker interface", interface = interface);
         return None;
     }
-    
+
     if interface.starts_with("veth") {
         debug!(message = "Skipping veth interface", interface = interface);
         return None;
     }
-    
+
     if interface.starts_with("br-") {
         debug!(message = "Skipping bridge interface", interface = interface);
         return None;
     }
-    
+
     // 记录最终接受的接口名称
     debug!(message = "Accepting interface", final_interface = interface);
     Some(interface.to_string())
-}
-
-/// 通过lldptool命令发现接口
-fn discover_interfaces_via_lldptool_commands(local_device_name: String) -> Result<Vec<LldpInterface>, LldpError> {
-    let mut interfaces = Vec::new();
-    
-    // 方法1: 尝试常见的网络接口名称
-    let common_interfaces = ["eth0", "eth1", "enp0s3", "enp0s8", "ens33", "wlan0"];
-    
-    for interface in &common_interfaces {
-        // 检查接口是否存在且启用了LLDP
-        let check_result = Command::new("lldptool")
-            .args(["-t", "-i", interface])
-            .output();
-            
-        if let Ok(output) = check_result {
-            if output.status.success() {
-                interfaces.push(LldpInterface {
-                    name: interface.to_string(),
-                    device_name: local_device_name.clone(),
-                });
-            }
-        }
-    }
-    
-    // 如果还是没有找到接口，至少返回本地设备信息
-    if interfaces.is_empty() {
-        interfaces.push(LldpInterface {
-            name: "unknown".to_string(),
-            device_name: local_device_name,
-        });
-    }
-    
-    Ok(interfaces)
 }
 
 /// 获取单个接口的LLDP邻居信息
@@ -821,56 +686,54 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
         .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in lldptool output".to_string()))?;
 
     // 解析lldptool输出
-    let mut current_neighbor: Option<(String, String)> = None; // (remote_device, remote_port)
-    
+    // let mut current_neighbor: Option<(String, String, String)> = None; // (chassis_id, system_name, port_id)
+    let mut chassis_id = String::new();
+    let mut system_name = String::new();
+    let mut port_id = String::new();
+
     for line in stdout.lines() {
         let line = line.trim();
-        
-        // 查找Chassis ID (设备名)
+
+        // 查找Chassis ID
         if line.starts_with("Chassis ID") {
             if let Some(colon_pos) = line.find(':') {
-                let chassis_id = line[colon_pos + 1..].trim();
-                if let Some((_, existing_port)) = current_neighbor.take() {
-                    // 如果已经有端口信息，创建邻居记录
-                    neighbors.push(LldpNeighbor {
-                        local_interface: interface.to_string(),
-                        local_device: get_local_device_name().unwrap_or_default(),
-                        remote_device: chassis_id.to_string(),
-                        remote_port: existing_port,
-                    });
-                }
-                current_neighbor = Some((chassis_id.to_string(), String::new()));
+                chassis_id = line[colon_pos + 1..].trim().to_string();
             }
         }
-        // 查找Port ID (端口名)
+        // 查找System Name (优先使用这个作为设备名)
+        else if line.starts_with("System Name") {
+            if let Some(colon_pos) = line.find(':') {
+                system_name = line[colon_pos + 1..].trim().to_string();
+            }
+        }
+        // 查找Port ID
         else if line.starts_with("Port ID") {
             if let Some(colon_pos) = line.find(':') {
-                let port_id = line[colon_pos + 1..].trim();
-                if let Some((existing_device, _)) = current_neighbor.take() {
-                    // 创建邻居记录
-                    neighbors.push(LldpNeighbor {
-                        local_interface: interface.to_string(),
-                        local_device: get_local_device_name().unwrap_or_default(),
-                        remote_device: existing_device,
-                        remote_port: port_id.to_string(),
-                    });
-                } else {
-                    // 只有端口信息，暂存
-                    current_neighbor = Some((String::new(), port_id.to_string()));
-                }
+                port_id = line[colon_pos + 1..].trim().to_string();
             }
         }
-    }
-    
-    // 处理最后可能剩余的邻居信息
-    if let Some((remote_device, remote_port)) = current_neighbor {
-        if !remote_device.is_empty() && !remote_port.is_empty() {
-            neighbors.push(LldpNeighbor {
-                local_interface: interface.to_string(),
-                local_device: get_local_device_name().unwrap_or_default(),
-                remote_device,
-                remote_port,
-            });
+        // 查找End of LLDPDU表示一个完整的邻居信息结束
+        else if line.starts_with("End of LLDPDU") && (!chassis_id.is_empty() || !system_name.is_empty()) {
+            // 使用System Name作为优先设备名，如果没有则使用Chassis ID
+            let remote_device = if !system_name.is_empty() {
+                system_name.clone()
+            } else {
+                chassis_id.clone()
+            };
+
+            if !remote_device.is_empty() && !port_id.is_empty() {
+                neighbors.push(LldpNeighbor {
+                    local_interface: interface.to_string(),
+                    local_device: get_local_device_name().unwrap_or_default(),
+                    remote_device,
+                    remote_port: port_id.clone(),
+                });
+            }
+
+            // 重置变量准备下一个邻居
+            chassis_id.clear();
+            system_name.clear();
+            port_id.clear();
         }
     }
 
