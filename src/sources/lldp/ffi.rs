@@ -537,51 +537,71 @@ async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpEr
         let mut all_interfaces = Vec::new();
         let local_device_name = get_local_device_name().unwrap_or_default();
 
-        // 使用lldptool直接获取接口信息
-        // 方法1: 尝试使用 lldptool -i any -p 获取所有LLDP接口
-        warn!(message = "Executing lldptool -i any -p command");
-        let lldptool_result = Command::new("lldptool")
-            .args(["-i", "any", "-p"])
+        // 使用更好的方法获取真实接口名称
+        // 方法1: 使用 ip link show 获取接口列表
+        warn!(message = "Getting interface list via ip link show");
+        let ip_link_result = Command::new("ip")
+            .args(["link", "show"])
             .output();
 
-        match lldptool_result {
+        match ip_link_result {
             Ok(output) => {
-                warn!(message = "lldptool command completed",
-                       success = output.status.success(),
-                       exit_code = output.status.code().unwrap_or(-1));
-                        
                 if output.status.success() {
                     let stdout = str::from_utf8(&output.stdout)
-                        .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in lldptool output".to_string()))?;
-
-                    warn!(message = "lldptool output", raw_output = stdout);
+                        .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in ip link output".to_string()))?;
                     
-                    // 解析lldptool输出获取接口列表
-                    for line in stdout.lines() {
-                        warn!(message = "Processing lldptool output line", line = line);
-                        let line = line.trim();
-                        if line.is_empty() || line.starts_with("Interface") {
-                            warn!(message = "Skipping header or empty line");
-                            continue;
-                        }
+                    warn!(message = "ip link show output", raw_output = stdout);
+                    
+                    // 解析ip link show输出获取接口列表
+                    let interfaces = parse_ip_link_output(stdout);
+                    warn!(message = "Found physical interfaces", count = interfaces.len(), interfaces = ?interfaces);
+                    
+                    // 对每个接口执行lldptool检查
+                    for interface in interfaces {
+                        warn!(message = "Checking LLDP status for interface", interface = &interface);
                         
-                        // 提取接口名称
-                        if let Some(interface_name) = extract_interface_from_lldptool_line(line) {
-                            debug!(message = "Adding interface to result", interface = &interface_name);
-                            all_interfaces.push(LldpInterface {
-                                name: interface_name,
-                                device_name: local_device_name.clone(),
-                            });
+                        let lldptool_check = Command::new("lldptool")
+                            .args(["-t", "-n", "-i", &interface])
+                            .output();
+                        
+                        match lldptool_check {
+                            Ok(check_output) => {
+                                if check_output.status.success() {
+                                    let check_stdout = str::from_utf8(&check_output.stdout)
+                                        .unwrap_or("");
+                                    
+                                    // 检查是否有有效的LLDP信息
+                                    if check_stdout.contains("Chassis ID") || 
+                                       check_stdout.contains("Port ID") ||
+                                       check_stdout.contains("TLV") {
+                                        warn!(message = "Interface has LLDP information", interface = &interface);
+                                        all_interfaces.push(LldpInterface {
+                                            name: interface,
+                                            device_name: local_device_name.clone(),
+                                        });
+                                    } else {
+                                        warn!(message = "Interface has no LLDP information", interface = &interface);
+                                    }
+                                } else {
+                                    warn!(message = "LLDP check failed for interface", 
+                                           interface = &interface,
+                                           stderr = String::from_utf8_lossy(&check_output.stderr).trim());
+                                }
+                            }
+                            Err(e) => {
+                                warn!(message = "Failed to check LLDP for interface", 
+                                       interface = &interface,
+                                       error = e.to_string());
+                            }
                         }
                     }
-                    warn!(message = "Processed all lldptool lines", interface_count = all_interfaces.len());
                 } else {
-                    warn!(message = "lldptool command failed", 
+                    warn!(message = "ip link show command failed", 
                           stderr = String::from_utf8_lossy(&output.stderr).trim());
                 }
             }
             Err(e) => {
-                warn!(message = "Failed to execute lldptool command", error = e.to_string());
+                warn!(message = "Failed to execute ip link show", error = e.to_string());
             }
         }
 
@@ -666,6 +686,36 @@ fn get_basic_interfaces() -> Result<Vec<LldpInterface>, LldpError> {
     }
     
     Ok(interfaces)
+}
+
+/// 解析ip link show输出，提取物理网络接口名称
+fn parse_ip_link_output(output: &str) -> Vec<String> {
+    let mut interfaces = Vec::new();
+    
+    for line in output.lines() {
+        // ip link show的输出格式通常是: "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000"
+        // 或者: "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000"
+        
+        if let Some(colon_pos) = line.find(':') {
+            let after_number = &line[colon_pos + 1..];
+            if let Some(colon_pos2) = after_number.find(':') {
+                let interface_name = after_number[..colon_pos2].trim();
+                
+                // 过滤掉不需要的接口
+                if !interface_name.is_empty() 
+                    && interface_name != "lo" 
+                    && !interface_name.starts_with("docker")
+                    && !interface_name.starts_with("veth")
+                    && !interface_name.starts_with("br-")
+                    && !interface_name.starts_with("virbr")
+                    && !interface_name.starts_with("vnet") {
+                    interfaces.push(interface_name.to_string());
+                }
+            }
+        }
+    }
+    
+    interfaces
 }
 
 /// 从lldptool输出行中提取接口名称

@@ -15,7 +15,15 @@ LABEL org.opencontainers.image.documentation="https://vector.dev/docs"
 
 # we want the latest versions of these
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata systemd liblldpctl-dev lldpad && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tzdata \
+        systemd \
+        liblldpctl-dev \
+        lldpad \
+        iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 COPY mx.tar.gz /opt/mx.tar.gz
 RUN tar -xvf /opt/mx.tar.gz -C /opt
 RUN rm -rf /opt/mx.tar.gz
