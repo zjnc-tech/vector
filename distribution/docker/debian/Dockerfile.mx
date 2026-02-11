@@ -22,7 +22,6 @@ RUN apt-get update && \
         systemd \
         liblldpctl-dev \
         lldpad \
-        iproute2 \
     && rm -rf /var/lib/apt/lists/*
 COPY mx.tar.gz /opt/mx.tar.gz
 RUN tar -xvf /opt/mx.tar.gz -C /opt

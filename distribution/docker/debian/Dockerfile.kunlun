@@ -22,7 +22,6 @@ RUN apt-get update && \
         systemd \
         liblldpctl-dev \
         lldpad \
-        iproute2 \
     && rm -rf /var/lib/apt/lists/*
 COPY klx.tar.gz /opt/klx.tar.gz
 RUN tar -xvf /opt/klx.tar.gz -C /opt
