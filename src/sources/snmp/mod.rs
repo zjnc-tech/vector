@@ -660,6 +660,8 @@ fn device_role(name: &str) -> &'static str {
         "leaf"
     } else if n.contains("RDSW") || n.contains("EDSW") || n.contains("SPINE") {
         "spine"
+    } else if n.contains("RMSW") {
+        "other"
     } else {
         "node"
     }
@@ -705,6 +707,11 @@ fn neighbors_to_logs(
 
         let local_role = device_role(&n.local_device);
         let remote_role = device_role(&n.remote_device);
+
+        // 如果包含other角色，则丢弃
+        if local_role == "other" || remote_role == "other" {
+            continue;
+        }
 
         let level = match (local_role, remote_role) {
             ("leaf", "spine") => Some("1"),
