@@ -622,48 +622,6 @@ fn get_interfaces_from_sys_class_net() -> Vec<String> {
     interfaces
 }
 
-/// 从lldptool输出行中提取接口名称
-// fn extract_interface_from_lldptool_line(line: &str) -> Option<String> {
-//     // 记录原始输入用于调试
-//     debug!(message = "Processing LLDP interface line", raw_line = line);
-//
-//     // lldptool -p 输出格式通常是: "eth0"
-//     let interface = line.trim();
-//
-//     // 记录处理后的接口名称
-//     debug!(message = "Trimmed interface name", trimmed_name = interface);
-//
-//     if interface.is_empty() {
-//         debug!(message = "Skipping empty interface line");
-//         return None;
-//     }
-//
-//     // 过滤掉不需要的虚拟接口
-//     if interface == "lo" {
-//         debug!(message = "Skipping loopback interface");
-//         return None;
-//     }
-//
-//     if interface.starts_with("docker") {
-//         debug!(message = "Skipping docker interface", interface = interface);
-//         return None;
-//     }
-//
-//     if interface.starts_with("veth") {
-//         debug!(message = "Skipping veth interface", interface = interface);
-//         return None;
-//     }
-//
-//     if interface.starts_with("br-") {
-//         debug!(message = "Skipping bridge interface", interface = interface);
-//         return None;
-//     }
-//
-//     // 记录最终接受的接口名称
-//     debug!(message = "Accepting interface", final_interface = interface);
-//     Some(interface.to_string())
-// }
-
 /// 获取单个接口的LLDP邻居信息
 fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>, LldpError> {
     let mut neighbors = Vec::new();
@@ -705,31 +663,50 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
     let mut chassis_id = String::new();
     let mut system_name = String::new();
     let mut port_id = String::new();
+    let mut expect_value_for = None; // 记录期望下一个值的字段类型
 
     for line in stdout.lines() {
         let line = line.trim();
         warn!(message = "Processing lldptool line", interface = interface, line = line);
 
-        // 查找Chassis ID
-        if line.starts_with("Chassis ID") {
-            if let Some(colon_pos) = line.find(':') {
-                chassis_id = line[colon_pos + 1..].trim().to_string();
-                warn!(message = "Found Chassis ID", interface = interface, chassis_id = &chassis_id);
+        // 查找字段标签
+        if line.ends_with("TLV") {
+            if line.starts_with("Chassis ID") {
+                expect_value_for = Some("chassis_id");
+            } else if line.starts_with("System Name") {
+                expect_value_for = Some("system_name");
+            } else if line.starts_with("Port ID") {
+                expect_value_for = Some("port_id");
             }
         }
-        // 查找System Name (优先使用这个作为设备名)
-        else if line.starts_with("System Name") {
-            if let Some(colon_pos) = line.find(':') {
-                system_name = line[colon_pos + 1..].trim().to_string();
-                warn!(message = "Found System Name", interface = interface, system_name = &system_name);
+        // 处理字段值
+        else if let Some(field_type) = expect_value_for {
+            match field_type {
+                "chassis_id" => {
+                    // Chassis ID可能是 "MAC: 54:c6:ff:a4:f0:aa" 格式
+                    if let Some(colon_pos) = line.find(':') {
+                        chassis_id = line[colon_pos + 1..].trim().to_string();
+                    } else {
+                        chassis_id = line.to_string();
+                    }
+                    warn!(message = "Found Chassis ID", interface = interface, chassis_id = &chassis_id);
+                },
+                "system_name" => {
+                    system_name = line.to_string();
+                    warn!(message = "Found System Name", interface = interface, system_name = &system_name);
+                },
+                "port_id" => {
+                    // Port ID可能是 "Ifname: Twenty-FiveGigE2/0/12" 格式
+                    if let Some(colon_pos) = line.find(':') {
+                        port_id = line[colon_pos + 1..].trim().to_string();
+                    } else {
+                        port_id = line.to_string();
+                    }
+                    warn!(message = "Found Port ID", interface = interface, port_id = &port_id);
+                },
+                _ => {}
             }
-        }
-        // 查找Port ID
-        else if line.starts_with("Port ID") {
-            if let Some(colon_pos) = line.find(':') {
-                port_id = line[colon_pos + 1..].trim().to_string();
-                warn!(message = "Found Port ID", interface = interface, port_id = &port_id);
-            }
+            expect_value_for = None;
         }
         // 查找End of LLDPDU表示一个完整的邻居信息结束
         else if line.starts_with("End of LLDPDU") {
