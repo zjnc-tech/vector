@@ -669,8 +669,8 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
         let line = line.trim();
         warn!(message = "Processing lldptool line", interface = interface, line = line);
 
-        // 查找字段标签
-        if line.ends_with("TLV") {
+        // 查找字段标签（排除End of LLDPDU TLV）
+        if line.ends_with("TLV") && !line.starts_with("End of LLDPDU") {
             if line.starts_with("Chassis ID") {
                 expect_value_for = Some("chassis_id");
             } else if line.starts_with("System Name") {
@@ -711,6 +711,13 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
         // 查找End of LLDPDU表示一个完整的邻居信息结束
         else if line.starts_with("End of LLDPDU") {
             warn!(message = "End of LLDPDU reached", interface = interface);
+
+            warn!(message = "Checking creation conditions",
+                   interface = interface,
+                   system_name_empty = system_name.is_empty(),
+                   port_id_empty = port_id.is_empty(),
+                   system_name = &system_name,
+                   port_id = &port_id);
             
             // 只要有system_name或port_id就创建邻居记录
             if !system_name.is_empty() || !port_id.is_empty() {
@@ -729,7 +736,9 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
                 warn!(message = "Creating LLDP neighbor record",
                        interface = interface,
                        remote_device = &remote_device,
-                       remote_port = &remote_port);
+                       remote_port = &remote_port,
+                       system_name = &system_name,
+                       port_id = &port_id);
                         
                 neighbors.push(LldpNeighbor {
                     local_interface: interface.to_string(),
@@ -737,13 +746,22 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
                     remote_device,
                     remote_port,
                 });
+
+                warn!(message = "Neighbor added to vector",
+                       interface = interface, 
+                       neighbor_count = neighbors.len());
+            } else {
+                warn!(message = "Skipping neighbor creation - no valid data",
+                       interface = interface,
+                       system_name = &system_name,
+                       port_id = &port_id);
             }
 
             // 重置变量准备下一个邻居
             chassis_id.clear();
             system_name.clear();
             port_id.clear();
-            warn!(message = "Reset parser variables for next neighbor", interface = interface);
+            debug!(message = "Reset parser variables for next neighbor", interface = interface);
         }
     }
 
