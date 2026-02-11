@@ -499,7 +499,6 @@ pub async fn get_lldp_interfaces_async() -> Result<Vec<LldpInterface>, LldpError
         Ok(interfaces) => Ok(interfaces),
         Err(LldpError::LibraryNotAvailable(_)) => {
             // 如果库不可用，回退到lldptool命令行工具
-            warn!("LLDP library not available for interfaces, falling back to lldptool");
             get_lldp_interfaces_via_lldptool().await
         }
         Err(e) => Err(e),
@@ -519,7 +518,6 @@ pub async fn get_lldp_neighbors_async() -> Result<Vec<LldpNeighbor>, LldpError> 
         Ok(neighbors) => Ok(neighbors),
         Err(LldpError::LibraryNotAvailable(_)) => {
             // 如果库不可用，回退到lldptool命令行工具
-            warn!("LLDP library not available, falling back to lldptool");
             get_lldp_neighbors_via_lldptool().await
         }
         Err(e) => Err(e),
@@ -533,13 +531,10 @@ async fn get_lldp_interfaces_via_lldptool() -> Result<Vec<LldpInterface>, LldpEr
         let local_device_name = get_local_device_name().unwrap_or_default();
 
         // 使用/sys/class/net方式获取真实接口名称
-        warn!(message = "Getting interface list via /sys/class/net");
         let interfaces = get_interfaces_from_sys_class_net();
-        warn!(message = "Found interfaces from sysfs", count = interfaces.len(), interfaces = ?interfaces);
 
         // 直接使用所有找到的物理接口，无需额外的LLDP检查
         for interface in interfaces {
-            warn!(message = "Adding interface to LLDP result", interface = &interface);
             all_interfaces.push(LldpInterface {
                 name: interface,
                 device_name: local_device_name.clone(),
@@ -625,14 +620,6 @@ fn get_interfaces_from_sys_class_net() -> Vec<String> {
 /// 获取单个接口的LLDP邻居信息
 fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>, LldpError> {
     let mut neighbors = Vec::new();
-
-    // 首先检查lldptool是否可用
-    if !is_lldptool_available() {
-        warn!("lldptool not found, skipping LLDP neighbor discovery for interface {}", interface);
-        return Ok(neighbors);
-    }
-
-    warn!(message = "Executing lldptool for interface", interface = interface);
     
     // 执行命令: lldptool -tni <interface>
     let output = Command::new("lldptool")
@@ -640,15 +627,9 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
         .output()
         .map_err(|e| LldpError::LibraryNotAvailable(format!("Failed to execute lldptool: {}", e)))?;
 
-    warn!(message = "lldptool command completed",
-           interface = interface,
-           success = output.status.success(),
-           exit_code = output.status.code().unwrap_or(-1));
-
     if !output.status.success() {
         // lldptool可能未安装或接口不支持LLDP
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("lldptool failed for interface {}: {}", interface, stderr);
         warn!(message = "lldptool stdout for failed interface", interface = interface, stdout = String::from_utf8_lossy(&output.stdout).as_ref());
         return Ok(neighbors);
     }
@@ -656,24 +637,17 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
     let stdout = str::from_utf8(&output.stdout)
         .map_err(|_| LldpError::LibraryNotAvailable("Invalid UTF-8 in lldptool output".to_string()))?;
 
-    warn!(message = "lldptool successful output", interface = interface, output_length = stdout.len());
-    warn!(message = "lldptool raw output", interface = interface, raw_output = stdout);
-    
     // 解析lldptool输出
-    let mut chassis_id = String::new();
     let mut system_name = String::new();
     let mut port_id = String::new();
     let mut expect_value_for = None; // 记录期望下一个值的字段类型
 
     for line in stdout.lines() {
         let line = line.trim();
-        warn!(message = "Processing lldptool line", interface = interface, line = line);
 
         // 查找字段标签（排除End of LLDPDU TLV）
         if line.ends_with("TLV") && !line.starts_with("End of LLDPDU") {
-            if line.starts_with("Chassis ID") {
-                expect_value_for = Some("chassis_id");
-            } else if line.starts_with("System Name") {
+            if line.starts_with("System Name") {
                 expect_value_for = Some("system_name");
             } else if line.starts_with("Port ID") {
                 expect_value_for = Some("port_id");
@@ -682,27 +656,15 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
         // 处理字段值
         else if let Some(field_type) = expect_value_for {
             match field_type {
-                "chassis_id" => {
-                    // Chassis ID可能是 "MAC: 54:c6:ff:a4:f0:aa" 格式
-                    if let Some(colon_pos) = line.find(':') {
-                        chassis_id = line[colon_pos + 1..].trim().to_string();
-                    } else {
-                        chassis_id = line.to_string();
-                    }
-                    warn!(message = "Found Chassis ID", interface = interface, chassis_id = &chassis_id);
-                },
                 "system_name" => {
                     system_name = line.to_string();
-                    warn!(message = "Found System Name", interface = interface, system_name = &system_name);
                 },
                 "port_id" => {
-                    // Port ID可能是 "Ifname: Twenty-FiveGigE2/0/12" 格式
                     if let Some(colon_pos) = line.find(':') {
                         port_id = line[colon_pos + 1..].trim().to_string();
                     } else {
                         port_id = line.to_string();
                     }
-                    warn!(message = "Found Port ID", interface = interface, port_id = &port_id);
                 },
                 _ => {}
             }
@@ -710,15 +672,6 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
         }
         // 查找End of LLDPDU表示一个完整的邻居信息结束
         else if line.starts_with("End of LLDPDU") {
-            warn!(message = "End of LLDPDU reached", interface = interface);
-
-            warn!(message = "Checking creation conditions",
-                   interface = interface,
-                   system_name_empty = system_name.is_empty(),
-                   port_id_empty = port_id.is_empty(),
-                   system_name = &system_name,
-                   port_id = &port_id);
-            
             // 只要有system_name或port_id就创建邻居记录
             if !system_name.is_empty() || !port_id.is_empty() {
                 let remote_device = if !system_name.is_empty() {
@@ -732,13 +685,6 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
                 } else {
                     "unknown_port".to_string()  // 如果没有port id，使用默认值
                 };
-
-                warn!(message = "Creating LLDP neighbor record",
-                       interface = interface,
-                       remote_device = &remote_device,
-                       remote_port = &remote_port,
-                       system_name = &system_name,
-                       port_id = &port_id);
                         
                 neighbors.push(LldpNeighbor {
                     local_interface: interface.to_string(),
@@ -746,22 +692,16 @@ fn get_lldp_neighbors_for_interface(interface: &str) -> Result<Vec<LldpNeighbor>
                     remote_device,
                     remote_port,
                 });
-
-                warn!(message = "Neighbor added to vector",
-                       interface = interface, 
-                       neighbor_count = neighbors.len());
             } else {
-                warn!(message = "Skipping neighbor creation - no valid data",
+                debug!(message = "Skipping neighbor creation - no valid data", 
                        interface = interface,
                        system_name = &system_name,
                        port_id = &port_id);
             }
 
             // 重置变量准备下一个邻居
-            chassis_id.clear();
             system_name.clear();
             port_id.clear();
-            debug!(message = "Reset parser variables for next neighbor", interface = interface);
         }
     }
 
