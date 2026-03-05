@@ -16,5 +16,3 @@ pub use scrape::PrometheusScrapeConfig;
 mod k8s_discovery;
 pub mod metrics_enrichment;
 pub mod k8s_scraper;
-mod metadata_cache;
-mod cache_manager;

@@ -1,16 +1,16 @@
-use k8s_openapi::api::core::v1::{Endpoints, Node, Pod, Service, Namespace};
-use kube::{api::{Api, ListParams}, Client, runtime::watcher};
+use k8s_openapi::api::core::v1::{Endpoints, Node, Pod, Service};
+use kube::{api::{Api}, Client, runtime::watcher};
+use kube::runtime::reflector::{self, store::Store, ObjectRef};  
 use std::sync::Arc;
-use futures::stream::Stream;
-use futures::StreamExt;
+use std::time::Duration;                                          
 use tokio::sync::RwLock;
 use serde::{Serialize, Deserialize};
 use tracing::{error, info, warn};
 use kube::runtime::WatchStreamExt;
 use vector_lib::configurable::Configurable;
-use super::metadata_cache::{MetadataCache, get_node_name_from_pod}; 
-use super::cache_manager::{get_watch_manager, NamespaceWatchGuard, NodeWatchGuard};
+use std::collections::{BTreeMap};
 
+use crate::kubernetes::{custom_reflector, meta_cache::MetaCache as K8sMetaCache};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -186,14 +186,53 @@ fn default_label_prefix() -> String { "".to_string() }
 #[allow(dead_code)]
 pub struct DiscoveredTarget {
     pub url: String,
-    
-    // ✅ 只存标识信息，抓取时从缓存实时获取元数据
-    pub pod_name: Option<String>,
-    pub pod_namespace: Option<String>,
-    pub node_name: Option<String>,
-    pub service_name: Option<String>,
-    pub service_namespace: Option<String>,
     pub job_name: String,
+    pub node_metadata: Option<Arc<NodeMetadata>>,
+    pub service_metadata: Option<Arc<ServiceMetadata>>,
+    pub pod_metadata: Option<Arc<PodMetadata>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodMetadata {
+    pub name: String,
+    pub namespace: String,
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+    pub pod_ip: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeMetadata {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+    pub node_ip: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServiceMetadata {
+    pub name: String,
+    pub namespace: String,
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+}
+
+impl DiscoveredTarget {
+    pub fn node_name(&self) -> Option<&str> {
+        self.node_metadata.as_deref().map(|m| m.name.as_str())
+    }
+    pub fn pod_name(&self) -> Option<&str> {
+        self.pod_metadata.as_deref().map(|m| m.name.as_str())
+    }
+
+    pub fn service_name(&self) -> Option<&str> {
+        self.service_metadata.as_deref().map(|m| m.name.as_str())
+    }
+    pub fn service_namespace(&self) -> Option<&str> {
+        self.service_metadata.as_deref().map(|m| m.namespace.as_str())
+    }
+    pub fn pod_namespace(&self) -> Option<&str> {
+        self.pod_metadata.as_deref().map(|m| m.namespace.as_str())
+    }
 }
 
 // ============================================================================
@@ -204,16 +243,14 @@ pub struct K8sServiceDiscovery {
     client: Client,
     config: KubernetesSdConfig,
     targets: Arc<RwLock<Vec<DiscoveredTarget>>>,
-    
-    // ✅ 改为使用全局缓存
-    pub metadata_cache: Arc<RwLock<MetadataCache>>,
-    
-    // ✅ 保存 Watch Guard（RAII 自动注销）
-    _namespace_guards: Vec<NamespaceWatchGuard>,
-    _node_guard: Option<NodeWatchGuard>,
-    
     // ✅ 只需要 shutdown_tx 来停止 Endpoints/Node 发现的 Watch
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    _shutdown_rx: tokio::sync::watch::Receiver<bool>,  // 用于保持 receiver 不被 drop
+
+    node_store: Store<Node>,  
+    endpoint_store: Store<Endpoints>,
+    pod_store: Store<Pod>,
+    service_store: Store<Service>,
 }
 
 impl Clone for K8sServiceDiscovery {
@@ -222,10 +259,12 @@ impl Clone for K8sServiceDiscovery {
             client: self.client.clone(),
             config: self.config.clone(),
             targets: Arc::clone(&self.targets),
-            metadata_cache: Arc::clone(&self.metadata_cache),
             shutdown_tx: Arc::clone(&self.shutdown_tx),
-            _namespace_guards: self._namespace_guards.clone(),
-            _node_guard: self._node_guard.clone(),
+            _shutdown_rx: self.shutdown_tx.subscribe(),
+            node_store: self.node_store.clone(),
+            endpoint_store: self.endpoint_store.clone(),
+            pod_store: self.pod_store.clone(),
+            service_store: self.service_store.clone(), 
         }
     }
 }
@@ -234,36 +273,79 @@ impl K8sServiceDiscovery {
     pub async fn new(config: KubernetesSdConfig) -> Result<Self> {
         let client = Client::try_default().await?;
         let targets = Arc::new(RwLock::new(Vec::new()));
-        
-        // ✅ 使用全局缓存
-        let metadata_cache = get_watch_manager().get_cache(); 
-        
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        
-        // ✅ 注册 namespace 和 node watch
-        let mut namespace_guards = Vec::new();
-        for namespace in &config.namespaces {
-            let guard = NamespaceWatchGuard::new(namespace.clone()).await?;
-            namespace_guards.push(guard);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let mut watcher_cfg = watcher::Config::default();
+        if let Some(ref sel) = config.field_selector {
+            watcher_cfg = watcher_cfg.fields(sel);
         }
-        
-        // ✅ 根据 role 决定是否需要 Node Watch，当前都需要
-        let node_guard = match config.role {
-            KubernetesRole::Node => Some(NodeWatchGuard::new().await?),
-            KubernetesRole::Endpoints => {
-                // endpoints 角色也需要 Node Watch（获取 Pod 所在节点的元数据）
-                Some(NodeWatchGuard::new().await?)
-            }
+        if let Some(ref sel) = config.label_selector {
+            watcher_cfg = watcher_cfg.labels(sel);
+        }
+
+        // 添加node_store
+        let node_store_w = reflector::store::Writer::<Node>::default();
+        let node_store = node_store_w.as_reader();
+        // 如果当前配置 role 是 Node，则使用用户传入的 watcher_cfg（保留 label/field selector），
+        // 否则使用默认 watcher 配置以获取集群中所有 Node（避免被 selector 限制）。
+        let node_watcher_cfg = if matches!(config.role, KubernetesRole::Node) {
+            watcher_cfg.clone()
+        } else {
+            watcher::Config::default()
         };
+        let node_reflector_stream = watcher(
+            Api::<Node>::all(client.clone()),
+            node_watcher_cfg,
+        )
+        .backoff(watcher::DefaultBackoff::default());
+        // 后台任务：持续同步所有 Node，支持延迟删除（60 s）
+        tokio::spawn(custom_reflector(
+            node_store_w,
+            K8sMetaCache::new(),
+            node_reflector_stream,
+            Duration::from_secs(60),
+        ));
+
+        // Endpoints
+        let ep_store_w = reflector::store::Writer::<Endpoints>::default();
+        let endpoint_store = ep_store_w.as_reader();
+        tokio::spawn(custom_reflector(
+            ep_store_w, K8sMetaCache::new(),
+            watcher(Api::<Endpoints>::all(client.clone()), watcher_cfg)
+                .backoff(watcher::DefaultBackoff::default()),
+            Duration::from_secs(30),
+        ));
+
+        // Pod
+        let pod_store_w = reflector::store::Writer::<Pod>::default();
+        let pod_store = pod_store_w.as_reader();
+        tokio::spawn(custom_reflector(
+            pod_store_w, K8sMetaCache::new(),
+            watcher(Api::<Pod>::all(client.clone()), watcher::Config::default())
+                .backoff(watcher::DefaultBackoff::default()),
+            Duration::from_secs(60),
+        ));
+
+        // Service
+        let svc_store_w = reflector::store::Writer::<Service>::default();
+        let service_store = svc_store_w.as_reader();
+        tokio::spawn(custom_reflector(
+            svc_store_w, K8sMetaCache::new(),
+            watcher(Api::<Service>::all(client.clone()), watcher::Config::default())
+                .backoff(watcher::DefaultBackoff::default()),
+            Duration::from_secs(60),
+        ));
         
         let discovery = Self {
             client,
             config,
             targets,
-            metadata_cache,
-            _namespace_guards: namespace_guards,
-            _node_guard: node_guard,
             shutdown_tx: Arc::new(shutdown_tx),
+            _shutdown_rx: shutdown_rx,
+            node_store,
+            endpoint_store,
+            pod_store,
+            service_store,
         };
         
         // ✅ 初始发现
@@ -290,7 +372,7 @@ impl K8sServiceDiscovery {
     
     async fn discover_targets_internal(&self) -> Result<Vec<DiscoveredTarget>> {
         match self.config.role {
-            KubernetesRole::Endpoints => self.discover_from_endpoints().await,
+            KubernetesRole::Endpoints => self.discover_from_endpoints(),
             KubernetesRole::Node => self.discover_from_nodes().await,
         }
     }
@@ -303,235 +385,157 @@ impl K8sServiceDiscovery {
         let discovery = self.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    info!("Endpoints watch task shutting down");
-                }
-                result = discovery.watch_and_update() => {
-                    if let Err(e) = result {
-                        error!("Endpoints watch task failed: {:?}", e);
+            // 每 30s 重新扫一次 store 快照，与 endpoint_store 的延迟删除窗口匹配
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        info!("Endpoints watch task shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        match discovery.discover_from_endpoints() {
+                            Ok(new_targets) => {
+                                *discovery.targets.write().await = new_targets;
+                            }
+                            Err(e) => {
+                                error!("Failed to refresh endpoints targets: {:?}", e);
+                            }
+                        }
                     }
                 }
             }
         });
     }
     
-    async fn watch_and_update(&self) -> Result<()> {
-        let stream = self.watch_endpoints().await?;
-        tokio::pin!(stream);
-
-        while let Some((endpoint_key, new_targets)) = stream.next().await {
-            let mut targets = self.targets.write().await;
-            
-            // ✅ 提取当前这个 endpoint 的旧 targets
-            let old_targets: Vec<_> = targets.iter()
-                .filter(|t| {
-                    if let (Some(ref ns), Some(ref name)) = (&t.service_namespace, &t.service_name) {
-                        format!("{}/{}", ns, name) == endpoint_key
-                    } else {
-                        false
-                    }
-                })
-                .cloned()
-                .collect();
-            
-            // ✅ 比较 targets 是否真的变了
-            let targets_changed = old_targets.len() != new_targets.len() 
-                || !old_targets.iter().all(|old| {
-                    new_targets.iter().any(|new| Self::targets_equal(old, new))
-                });
-            
-            if targets_changed {
-                // 只在真正变化时才更新
-                targets.retain(|t| {
-                    if let (Some(ref ns), Some(ref name)) = (&t.service_namespace, &t.service_name) {
-                        format!("{}/{}", ns, name) != endpoint_key
-                    } else {
-                        true
-                    }
-                });
-                
-                targets.extend(new_targets.clone());
-                
-                info!("Updated targets for {}, total targets: {}", endpoint_key, targets.len());
-            }
-        }
-        
-        Ok(())
-    }
-
-    // ✅ 辅助函数：比较两个 target 是否相等
-    fn targets_equal(a: &DiscoveredTarget, b: &DiscoveredTarget) -> bool {
-        a.url == b.url 
-            && a.pod_name == b.pod_name
-            && a.pod_namespace == b.pod_namespace
-            && a.node_name == b.node_name
-            && a.service_name == b.service_name
-            && a.service_namespace == b.service_namespace
-    }
-    
-    async fn discover_from_endpoints(&self) -> Result<Vec<DiscoveredTarget>> {
+    fn discover_from_endpoints(&self) -> Result<Vec<DiscoveredTarget>> {
         let mut all_targets = Vec::new();
-        
-        for namespace in self.get_namespaces().await? {
-            let endpoints_api: Api<Endpoints> = Api::namespaced(self.client.clone(), &namespace);
-            let services_api: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
-            let pods_api: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
-            
-            let lp = self.build_list_params();
-            let endpoints_list = endpoints_api.list(&lp).await?;
-            
-            for endpoints in endpoints_list.items {
-                let targets = self.discover_from_endpoints_internal(
-                    &endpoints,
-                    &services_api,
-                    &pods_api,
-                ).await.unwrap_or_default();
-                
-                all_targets.extend(targets);
+
+        // store.state() 返回 Arc<Endpoints> 的快照，纯内存，不 async
+        let all_endpoints = self.endpoint_store.state();
+        let allowed_ns: Option<&[String]> = if self.config.namespaces.is_empty() {
+            None  // 空 = 全部 namespace
+        } else {
+            Some(&self.config.namespaces)
+        };
+
+        for ep in all_endpoints {
+            // namespace 过滤
+            let ep_ns = match ep.metadata.namespace.as_deref() {
+                Some(ns) => ns,
+                None => continue,
+            };
+            if let Some(allowed) = allowed_ns {
+                if !allowed.iter().any(|n| n == ep_ns) {
+                    continue;
+                }
             }
+
+            let targets = self.discover_from_endpoints_internal(&ep)?;
+            all_targets.extend(targets);
         }
         
         Ok(all_targets)
     }
 
-    async fn watch_endpoints(&self) -> Result<impl Stream<Item = (String, Vec<DiscoveredTarget>)> + '_> {
-        let client = self.client.clone();
-        let config_data = self.config.clone();
-        
-        let stream = async_stream::stream! {
-            for namespace in config_data.namespaces.iter() {
-                let endpoints_api: Api<Endpoints> = Api::namespaced(client.clone(), namespace);
-                let services_api: Api<Service> = Api::namespaced(client.clone(), namespace);
-                let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-                
-                let mut watcher_config = kube::runtime::watcher::Config::default();
-                if let Some(ref selector) = config_data.label_selector {
-                    watcher_config = watcher_config.labels(selector);
-                }
-            
-                if let Some(ref field_sel) = config_data.field_selector {
-                    watcher_config = watcher_config.fields(field_sel);
-                }
-                
-                let mut stream = Box::pin(watcher(endpoints_api, watcher_config).applied_objects());
-                
-                while let Some(endpoints_result) = stream.next().await {
-                    match endpoints_result {
-                        Ok(endpoints) => {
-                            let targets = self.discover_from_endpoints_internal(
-                                &endpoints,
-                                &services_api,
-                                &pods_api,
-                            ).await.unwrap_or_default();
-                            
-                            if let Some(first) = targets.first() {
-                                if let (Some(ref ns), Some(ref name)) = (&first.service_namespace, &first.service_name) {
-                                    let endpoint_key = format!("{}/{}", ns, name);
-                                    yield (endpoint_key, targets);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Watch error: {:?}", e);
-                        }
-                    }
-                }
-            }
-        };
-        
-        Ok(stream)
-    }
-
-    async fn discover_from_endpoints_internal(
+    fn discover_from_endpoints_internal(
         &self,
         endpoints: &Endpoints,
-        services_api: &Api<Service>,
-        pods_api: &Api<Pod>,
     ) -> Result<Vec<DiscoveredTarget>> {
         let mut targets = Vec::new();
-        let nodes_api: Api<Node> = Api::all(self.client.clone());
-        
-        let endpoints_name = match endpoints.metadata.name.as_ref() {
-            Some(name) => name,
+        let endpoints_name = match endpoints.metadata.name.as_deref() {
+            Some(n) => n,
             None => return Ok(targets),
         };
-        
-        let namespace = endpoints.metadata.namespace.as_ref()
-            .ok_or("Endpoints has no namespace")?;
-        
-        // ✅ 预加载 Service 元数据到缓存
-        let mut cache = self.metadata_cache.write().await;
-        let _ = cache.get_or_fetch_service(namespace, endpoints_name, services_api).await;
-        
-        if let Some(subsets) = &endpoints.subsets {
-            for subset in subsets {
-                if let Some(addresses) = &subset.addresses {
-                    for address in addresses {
-                        if let Some(ports) = &subset.ports {
-                            for port in ports {
-                                if let Some(ref port_filter) = self.config.port {
-                                    let port_matches = if let Ok(port_num) = port_filter.parse::<i32>() {
-                                        port.port == port_num
-                                    } else {
-                                        port.name.as_deref() == Some(port_filter.as_str())
-                                    };
-                                    
-                                    if !port_matches {
-                                        continue;
-                                    }
-                                }
-                                
-                                let url = format!(
-                                    "{}://{}:{}{}",
-                                    self.config.scheme,
-                                    address.ip,
-                                    port.port,
-                                    self.config.metrics_path
-                                );
-                                
-                                let (pod_name, pod_namespace, node_name) = if let Some(target_ref) = &address.target_ref {
-                                    if target_ref.kind.as_deref() == Some("Pod") {
-                                        if let Some(pod_name) = &target_ref.name {
-                                            // ✅ 预加载 Pod 元数据到缓存
-                                            let _ = cache.get_or_fetch_pod(namespace, pod_name, pods_api).await;
-                                            
-                                            let node_name = if let Ok(Some(node_name)) = get_node_name_from_pod(pod_name, namespace, pods_api).await {
-                                                // ✅ 预加载 Node 元数据到缓存
-                                                let _ = cache.get_or_fetch_node(&node_name, &nodes_api).await;
-                                                Some(node_name)
-                                            } else {
-                                                None
-                                            };
-                                            
-                                            (Some(pod_name.clone()), Some(namespace.to_string()), node_name)
-                                        } else {
-                                            (None, None, None)
-                                        }
-                                    } else {
-                                        (None, None, None)
-                                    }
-                                } else {
-                                    (None, None, None)
-                                };
-                                
-                                targets.push(DiscoveredTarget {
-                                    url,
-                                    pod_name,
-                                    pod_namespace,
-                                    node_name,
-                                    service_name: Some(endpoints_name.clone()),
-                                    service_namespace: Some(namespace.clone()),
-                                    job_name: self.config.job_name.clone(),
+        let namespace = match endpoints.metadata.namespace.as_deref() {
+            Some(ns) => ns,
+            None => return Ok(targets),
+        };
+        // ─── Service 元数据（从 store，同步）───
+        let service_metadata = self.service_store
+            .get(&ObjectRef::<Service>::new(endpoints_name).within(namespace))
+            .map(|s| Arc::new(ServiceMetadata {
+                name: s.metadata.name.clone().unwrap_or_default(),
+                namespace: s.metadata.namespace.clone().unwrap_or_default(),
+                labels: s.metadata.labels.clone().unwrap_or_default(),
+                annotations: s.metadata.annotations.clone().unwrap_or_default(),
+            }));
+
+        let Some(subsets) = &endpoints.subsets else { return Ok(targets) };
+        for subset in subsets {
+            let Some(addresses) = &subset.addresses else { continue };
+            let Some(ports) = &subset.ports else { continue };
+
+            for address in addresses {
+                // ─── Pod / Node 元数据（从 store，同步）───
+                let (pod_metadata, node_metadata) = if let Some(r) = &address.target_ref {
+                    if r.kind.as_deref() == Some("Pod") {
+                        if let Some(pod_name) = &r.name {
+                            let pod = self.pod_store
+                                .get(&ObjectRef::<Pod>::new(pod_name).within(namespace));
+
+                            let pod_meta = pod.as_ref().map(|p| Arc::new(PodMetadata {
+                                name: p.metadata.name.clone().unwrap_or_default(),
+                                namespace: p.metadata.namespace.clone().unwrap_or_default(),
+                                labels: p.metadata.labels.clone().unwrap_or_default(),
+                                annotations: p.metadata.annotations.clone().unwrap_or_default(),
+                                pod_ip: p.status.as_ref().and_then(|s| s.pod_ip.clone()),
+                            }));
+
+                            // node_name 来自 Pod.spec.node_name
+                            let node_meta = pod.as_ref()
+                                .and_then(|p| p.spec.as_ref()?.node_name.as_ref().map(|n| n.clone()))
+                                .and_then(|node_name| {
+                                    self.node_store.get(&ObjectRef::<Node>::new(&node_name))
+                                        .map(|n| {
+                                            let node_ip = n.status.as_ref()
+                                                .and_then(|s| s.addresses.as_ref())
+                                                .and_then(|a| a.iter().find(|a| a.type_ == "InternalIP"))
+                                                .map(|a| a.address.clone());
+                                            Arc::new(NodeMetadata {
+                                                name: node_name,
+                                                labels: n.metadata.labels.clone().unwrap_or_default(),
+                                                node_ip,
+                                            })
+                                        })
                                 });
-                            }
+
+                            (pod_meta, node_meta)
+                        } else { (None, None) }
+                    } else { (None, None) }
+                } else { (None, None) };
+
+                for port in ports {
+                     if let Some(ref port_filter) = self.config.port {
+                        let port_matches = if let Ok(port_num) = port_filter.parse::<i32>() {
+                            port.port == port_num
+                        } else {
+                            port.name.as_deref() == Some(port_filter.as_str())
+                        };
+                        
+                        if !port_matches {
+                            continue;
                         }
                     }
+                    // port 过滤
+                    let url = format!(
+                        "{}://{}:{}{}",
+                        self.config.scheme,
+                        address.ip,
+                        port.port,
+                        self.config.metrics_path
+                    );
+
+                    targets.push(DiscoveredTarget {
+                        url,
+                        job_name: self.config.job_name.clone(),
+                        pod_metadata: pod_metadata.clone(),
+                        node_metadata: node_metadata.clone(),
+                        service_metadata: service_metadata.clone(),
+                    });
                 }
             }
         }
-        
-        drop(cache);
         Ok(targets)
     }
 
@@ -543,91 +547,34 @@ impl K8sServiceDiscovery {
         let discovery = self.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    info!("Nodes watch task shutting down");
-                }
-                result = discovery.watch_nodes_and_update() => {
-                    if let Err(e) = result {
-                        error!("Nodes watch task failed: {:?}", e);
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        info!("Nodes watch task shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        match discovery.discover_from_nodes().await {
+                            Ok(new_targets) => {
+                                *discovery.targets.write().await = new_targets;
+                            }
+                            Err(e) => {
+                                error!("Failed to refresh nodes targets: {:?}", e);
+                            }
+                        }
                     }
                 }
             }
         });
     }
 
-    async fn watch_nodes_and_update(&self) -> Result<()> {
-        let stream = self.watch_nodes().await?;
-        tokio::pin!(stream);
-
-        while let Some((node_name, new_targets)) = stream.next().await {
-            let mut targets = self.targets.write().await;
-            
-            // ✅ 提取当前 node 的旧 targets
-            let old_targets: Vec<_> = targets.iter()
-                .filter(|t| t.node_name.as_ref() == Some(&node_name))
-                .cloned()
-                .collect();
-            
-            // ✅ 比较 targets 是否变化
-            let targets_changed = old_targets.len() != new_targets.len()
-                || !old_targets.iter().all(|old| {
-                    new_targets.iter().any(|new| Self::targets_equal(old, new))
-                });
-            
-            if targets_changed {
-                targets.retain(|t| t.node_name.as_ref() != Some(&node_name));
-                targets.extend(new_targets);
-                info!("Updated targets for node {}, total targets: {}", node_name, targets.len());
-            }
-        }
-        
-        Ok(())
-    }
-
-    async fn watch_nodes(&self) -> Result<impl Stream<Item = (String, Vec<DiscoveredTarget>)> + '_> {
-        let client = self.client.clone();
-        let config_data = self.config.clone();
-        
-        let stream = async_stream::stream! {
-            let nodes_api: Api<Node> = Api::all(client.clone());
-            
-            let mut watcher_config = kube::runtime::watcher::Config::default();
-            if let Some(ref selector) = config_data.label_selector {
-                watcher_config = watcher_config.labels(selector);
-            }
-        
-            if let Some(ref field_sel) = config_data.field_selector {
-                watcher_config = watcher_config.fields(field_sel);
-            }
-            
-            let mut stream = Box::pin(watcher(nodes_api, watcher_config).applied_objects());
-            
-            while let Some(node_result) = stream.next().await {
-                match node_result {
-                    Ok(node) => {
-                        let node_name = node.metadata.name.clone().unwrap_or_default();
-                        let targets = self.discover_from_node_internal(&node).await.unwrap_or_default();
-                        yield (node_name, targets);
-                    }
-                    Err(e) => {
-                        error!("Node watch error: {:?}", e);
-                    }
-                }
-            }
-        };
-        
-        Ok(stream)
-    }
 
     async fn discover_from_nodes(&self) -> Result<Vec<DiscoveredTarget>> {
         let mut all_targets = Vec::new();
+        let all_nodes = self.node_store.state();
         
-        let nodes_api: Api<Node> = Api::all(self.client.clone());
-        let lp = self.build_list_params();
-        let nodes_list = nodes_api.list(&lp).await?;
-        
-        for node in nodes_list.items {
+        for node in all_nodes {
             let targets = self.discover_from_node_internal(&node).await.unwrap_or_default();
             all_targets.extend(targets);
         }
@@ -679,44 +626,31 @@ impl K8sServiceDiscovery {
             port,
             self.config.metrics_path
         );
-        
-        // ✅ 预加载 Node 元数据到缓存
-        let mut cache = self.metadata_cache.write().await;
-        let _ = cache.get_or_fetch_node(node_name, &Api::all(self.client.clone())).await;
-        drop(cache);
+
+        // ─── Node 角色：node 对象就在手，直接从变量取 labels ───
+        let node_metadata = self.node_store
+            .get(&ObjectRef::<Node>::new(node_name))
+            .map(|n| {
+                let node_ip = n.status.as_ref()
+                    .and_then(|s| s.addresses.as_ref())
+                    .and_then(|addrs| addrs.iter().find(|a| a.type_ == "InternalIP"))
+                    .map(|a| a.address.clone());
+                Arc::new(NodeMetadata {
+                    name: node_name.to_string(),
+                    labels: n.metadata.labels.clone().unwrap_or_default(),
+                    node_ip,
+                })
+            });
         
         targets.push(DiscoveredTarget {
             url,
-            pod_name: None,
-            pod_namespace: None,
-            node_name: Some(node_name.clone()),
-            service_name: None,
-            service_namespace: None,
             job_name: self.config.job_name.clone(),
+            node_metadata,
+            pod_metadata: None,
+            service_metadata: None,
         });
         
         Ok(targets)
-    }
-
-    async fn get_namespaces(&self) -> Result<Vec<String>> {
-        if self.config.namespaces.is_empty() {
-            let ns_api: Api<Namespace> = Api::all(self.client.clone());
-            let ns_list = ns_api.list(&ListParams::default()).await?;
-            Ok(ns_list.items.iter().filter_map(|ns| ns.metadata.name.clone()).collect())
-        } else {
-            Ok(self.config.namespaces.clone())
-        }
-    }
-
-    fn build_list_params(&self) -> ListParams {
-        let mut lp = ListParams::default();
-        if let Some(ref selector) = self.config.label_selector {
-            lp = lp.labels(selector);
-        }
-        if let Some(ref field_sel) = self.config.field_selector {
-            lp = lp.fields(field_sel);
-        }
-        lp
     }
 }
 
