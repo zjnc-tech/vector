@@ -178,10 +178,6 @@ impl Default for MetadataLabelsConfig {
 fn default_true() -> bool { true }
 fn default_label_prefix() -> String { "".to_string() }
 
-// ============================================================================
-// ✅ 发现的目标（方案1：只存 ID，不存元数据）
-// ============================================================================
-
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct DiscoveredTarget {
@@ -236,7 +232,7 @@ impl DiscoveredTarget {
 }
 
 // ============================================================================
-// Kubernetes 服务发现 - 通用基础设施
+// Kubernetes 服务发现实现
 // ============================================================================
 
 pub struct K8sServiceDiscovery {
@@ -245,7 +241,6 @@ pub struct K8sServiceDiscovery {
     targets: Arc<RwLock<Vec<DiscoveredTarget>>>,
     // ✅ 只需要 shutdown_tx 来停止 Endpoints/Node 发现的 Watch
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
-    _shutdown_rx: tokio::sync::watch::Receiver<bool>,  // 用于保持 receiver 不被 drop
 
     node_store: Store<Node>,  
     endpoint_store: Store<Endpoints>,
@@ -260,7 +255,6 @@ impl Clone for K8sServiceDiscovery {
             config: self.config.clone(),
             targets: Arc::clone(&self.targets),
             shutdown_tx: Arc::clone(&self.shutdown_tx),
-            _shutdown_rx: self.shutdown_tx.subscribe(),
             node_store: self.node_store.clone(),
             endpoint_store: self.endpoint_store.clone(),
             pod_store: self.pod_store.clone(),
@@ -273,7 +267,7 @@ impl K8sServiceDiscovery {
     pub async fn new(config: KubernetesSdConfig) -> Result<Self> {
         let client = Client::try_default().await?;
         let targets = Arc::new(RwLock::new(Vec::new()));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
 
         let mut watcher_cfg = watcher::Config::default();
         if let Some(ref sel) = config.field_selector {
@@ -341,7 +335,6 @@ impl K8sServiceDiscovery {
             config,
             targets,
             shutdown_tx: Arc::new(shutdown_tx),
-            _shutdown_rx: shutdown_rx,
             node_store,
             endpoint_store,
             pod_store,
@@ -355,10 +348,10 @@ impl K8sServiceDiscovery {
         // ✅ 启动 Endpoints/Node 发现的 Watch（这些仍然是每个 source 独立的）
         match discovery.config.role {
             KubernetesRole::Endpoints => {
-                discovery.start_endpoints_watch_task();
+                discovery.start_endpoints_poll_task();
             }
             KubernetesRole::Node => {
-                discovery.start_nodes_watch_task();
+                discovery.start_nodes_poll_task();
             }
         }
         
@@ -378,15 +371,15 @@ impl K8sServiceDiscovery {
     }
 
     // ============================================================================
-    // Endpoints 角色实现
+    // Endpoints 轮询更新
     // ============================================================================
     
-    fn start_endpoints_watch_task(&self) {
+    fn start_endpoints_poll_task(&self) {
         let discovery = self.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             // 每 30s 重新扫一次 store 快照，与 endpoint_store 的延迟删除窗口匹配
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -540,14 +533,14 @@ impl K8sServiceDiscovery {
     }
 
     // ============================================================================
-    // Node 角色实现
+    // Node 轮询更新
     // ============================================================================
     
-    fn start_nodes_watch_task(&self) {
+    fn start_nodes_poll_task(&self) {
         let discovery = self.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
