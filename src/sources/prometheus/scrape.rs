@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -7,7 +6,7 @@ use http::{response::Parts, Uri};
 use serde_with::serde_as;
 use snafu::ResultExt;
 use vector_lib::configurable::configurable_component;
-use vector_lib::{config::LogNamespace, event::Event};
+use vector_lib::{config::LogNamespace, event::{Event}};
 
 use super::parser;
 use crate::http::QueryParameters;
@@ -28,6 +27,13 @@ use crate::{
     Result,
 };
 
+use typetag::serde;
+use std::collections::HashMap;
+use super::k8s_discovery::{
+    KubernetesSdConfig,
+};
+use super::k8s_scraper::K8sScraper;
+
 // pulled up, and split over multiple lines, because the long lines trip up rustfmt such that it
 // gave up trying to format, but reported no error
 static PARSE_ERROR_NO_PATH: &str = "No path is set on the endpoint and we got a parse error,\
@@ -47,6 +53,7 @@ pub struct PrometheusScrapeConfig {
     /// Endpoints to scrape metrics from.
     #[configurable(metadata(docs::examples = "http://localhost:9090/metrics"))]
     #[serde(alias = "hosts")]
+    #[serde(default)] 
     endpoints: Vec<String>,
 
     /// The interval between scrapes. Requests are run concurrently so if a scrape takes longer
@@ -103,6 +110,15 @@ pub struct PrometheusScrapeConfig {
     #[configurable(derived)]
     #[configurable(metadata(docs::advanced))]
     auth: Option<Auth>,
+
+    // 新增：Kubernetes 服务发现配置
+    /// Configuration for Kubernetes service discovery.
+    ///
+    /// When enabled, automatically discovers Prometheus targets from Kubernetes resources
+    /// such as pods, services, or endpoints.
+    #[serde(default)]
+    #[configurable(metadata(docs::advanced))]
+    pub kubernetes_sd: Option<KubernetesSdConfig>,  // 使用导入的类型
 }
 
 fn query_example() -> serde_json::Value {
@@ -126,6 +142,7 @@ impl GenerateConfig for PrometheusScrapeConfig {
             query: HashMap::new(),
             tls: None,
             auth: None,
+            kubernetes_sd: None,
         })
         .unwrap()
     }
@@ -135,35 +152,44 @@ impl GenerateConfig for PrometheusScrapeConfig {
 #[typetag::serde(name = "prometheus_scrape")]
 impl SourceConfig for PrometheusScrapeConfig {
     async fn build(&self, cx: SourceContext) -> Result<sources::Source> {
-        let urls = self
-            .endpoints
-            .iter()
-            .map(|s| s.parse::<Uri>().context(sources::UriParseSnafu))
-            .map(|r| r.map(|uri| build_url(&uri, &self.query)))
-            .collect::<std::result::Result<Vec<Uri>, sources::BuildError>>()?;
-        let tls = TlsSettings::from_options(self.tls.as_ref())?;
+        // ====== 修改点 1: 改变 urls 的获取方式 ======
+       if let Some(ref k8s_config) = self.kubernetes_sd {
+            // Kubernetes 服务发现模式
+            self.build_k8s_scraper(k8s_config, cx).await
+        } else {
+            // 使用静态 endpoints（保持原来的逻辑）
+            let urls = self
+                .endpoints
+                .iter()
+                .map(|s| s.parse::<Uri>().context(sources::UriParseSnafu))
+                .map(|r| r.map(|uri| build_url(&uri, &self.query)))
+                .collect::<std::result::Result<Vec<Uri>, sources::BuildError>>()?;
 
-        let builder = PrometheusScrapeBuilder {
-            honor_labels: self.honor_labels,
-            instance_tag: self.instance_tag.clone(),
-            endpoint_tag: self.endpoint_tag.clone(),
-        };
+            let tls = TlsSettings::from_options(self.tls.as_ref())?;
 
-        warn_if_interval_too_low(self.timeout, self.interval);
+            let builder = PrometheusScrapeBuilder {
+                honor_labels: self.honor_labels,
+                instance_tag: self.instance_tag.clone(),
+                endpoint_tag: self.endpoint_tag.clone(),
+            };
 
-        let inputs = GenericHttpClientInputs {
-            urls,
-            interval: self.interval,
-            timeout: self.timeout,
-            headers: HashMap::new(),
-            content_type: "text/plain".to_string(),
-            auth: self.auth.clone(),
-            tls,
-            proxy: cx.proxy.clone(),
-            shutdown: cx.shutdown,
-        };
+            warn_if_interval_too_low(self.timeout, self.interval);
 
-        Ok(call(inputs, builder, cx.out, HttpMethod::Get).boxed())
+            let inputs = GenericHttpClientInputs {
+                urls,
+                interval: self.interval,
+                timeout: self.timeout,
+                headers: HashMap::new(),
+                content_type: "text/plain".to_string(),
+                auth: self.auth.clone(),
+                tls,
+                proxy: cx.proxy.clone(),
+                shutdown: cx.shutdown,
+            };
+
+            Ok(call(inputs, builder, cx.out, HttpMethod::Get).boxed())
+        }
+
     }
 
     fn outputs(&self, _global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
@@ -195,6 +221,35 @@ struct EndpointInfo {
     honor_label: bool,
 }
 
+impl PrometheusScrapeConfig {
+    /// 构建 Kubernetes 服务发现模式的 scraper
+    async fn build_k8s_scraper(
+        &self,
+        k8s_config: &KubernetesSdConfig,
+        cx: SourceContext,
+    ) -> Result<sources::Source> {
+            let scraper = K8sScraper::new(
+            k8s_config.clone(),
+            self.tls.clone(),
+            self.auth.clone(),
+            self.query.clone(),
+            self.timeout,
+            self.honor_labels,
+            self.instance_tag.clone(),
+            self.endpoint_tag.clone(),
+            &cx.proxy,
+        ).await?;
+        
+        let interval = self.interval;
+        let shutdown = cx.shutdown;
+        let out = cx.out;
+        
+        Ok(Box::pin(async move {
+            scraper.run(interval, shutdown, out).await
+        }))
+    }
+    
+}
 /// Captures the configuration options required to build request-specific context.
 #[derive(Clone)]
 struct PrometheusScrapeBuilder {
@@ -229,6 +284,7 @@ impl HttpClientBuilder for PrometheusScrapeBuilder {
             endpoint: url.to_string(),
             honor_label: self.honor_labels,
         });
+
         PrometheusScrapeContext {
             instance_info,
             endpoint_info,
@@ -368,6 +424,7 @@ mod test {
             query: HashMap::new(),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -402,6 +459,7 @@ mod test {
             query: HashMap::new(),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -454,6 +512,7 @@ mod test {
             query: HashMap::new(),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -520,6 +579,7 @@ mod test {
             query: HashMap::new(),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -585,6 +645,7 @@ mod test {
             ]),
             auth: None,
             tls: None,
+            kubernetes_sd: None,
         };
 
         let events = run_and_assert_source_compliance(
@@ -687,6 +748,7 @@ mod test {
                 timeout: default_timeout(),
                 tls: None,
                 auth: None,
+                kubernetes_sd: None,
             },
         );
         config.add_sink(

@@ -13,3 +13,6 @@ pub use pushgateway::PrometheusPushgatewayConfig;
 pub use remote_write::PrometheusRemoteWriteConfig;
 #[cfg(feature = "sources-prometheus-scrape")]
 pub use scrape::PrometheusScrapeConfig;
+mod k8s_discovery;
+pub mod metrics_enrichment;
+pub mod k8s_scraper;
