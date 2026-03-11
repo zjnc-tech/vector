@@ -137,7 +137,7 @@ fn add_labels_to_metric(
     };
     
     for (key, value) in selected_labels {
-        let tag_name = format!("{}{}", prefix, key);
+        let tag_name = format!("{}{}", prefix, sanitize_label_name(&key));
         if !honor_labels || metric.tag_value(&tag_name).is_none() {
             metric.replace_tag(tag_name, value);
         }
