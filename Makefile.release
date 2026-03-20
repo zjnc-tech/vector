@@ -1,0 +1,154 @@
+# ========================
+# Vector 自定义发布 Makefile
+# ========================
+# 用法：make -f Makefile.release release-custom VENDOR=mt VERSION=v0.1.5
+# ========================
+
+ROOT_DIR := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
+ARTIFACTS_DIR := $(ROOT_DIR)/target/artifacts
+
+VERSION ?= v0.1.5
+VENDOR ?= cpu
+
+DOCKER_REGISTRY ?= harbor.zhejianglab.com/zjnc-tech
+INNER_REGISTRY ?= 10.200.53.201:30000/moer
+
+IMAGE_NAME := vector
+FULL_IMAGE := $(DOCKER_REGISTRY)/$(IMAGE_NAME):$(VERSION)-$(VENDOR)
+INNER_IMAGE := $(INNER_REGISTRY)/$(IMAGE_NAME):$(VERSION)-$(VENDOR)
+
+SUPPORTED_VENDORS := cpu mt mx kunlun nv
+
+# ========================
+# Dockerfile 映射
+# ========================
+DOCKERFILE_cpu := distribution/docker/debian/Dockerfile.cpu
+DOCKERFILE_mt := distribution/docker/debian/Dockerfile.mt
+DOCKERFILE_mx := distribution/docker/debian/Dockerfile.mx
+DOCKERFILE_kunlun := distribution/docker/debian/Dockerfile.kunlun
+DOCKERFILE_nv := distribution/docker/debian/Dockerfile.dcgm
+
+DOCKERFILE := $(DOCKERFILE_$(VENDOR))
+
+# ========================
+# 依赖包映射（CPU / NV 无依赖）
+# ========================
+VENDOR_PKG_mt := moer.tar.gz
+VENDOR_PKG_mx := mx.tar.gz
+VENDOR_PKG_kunlun := klx.tar.gz
+
+VENDOR_PKG := $(VENDOR_PKG_$(VENDOR))
+
+# ========================
+# 目录
+# ========================
+$(ARTIFACTS_DIR):
+	@mkdir -p $(ARTIFACTS_DIR)
+
+# ========================
+# 校验 VENDOR
+# ========================
+.PHONY: check-vendor
+check-vendor:
+	@if ! echo "$(SUPPORTED_VENDORS)" | grep -w "$(VENDOR)" > /dev/null; then \
+		echo "Unsupported VENDOR: $(VENDOR)"; \
+		echo "Supported: $(SUPPORTED_VENDORS)"; \
+		exit 1; \
+	fi
+
+# ========================
+# 编译
+# ========================
+.PHONY: build
+build: check-vendor
+	@echo "Building vector in $(ROOT_DIR)..."
+	@$(MAKE) -f Makefile package-x86_64-unknown-linux-gnu
+
+# ========================
+# 拉取依赖（非 CPU / 非 NV）
+# ========================
+.PHONY: vendor
+vendor: check-vendor $(ARTIFACTS_DIR)
+	@if [ "$(VENDOR)" = "cpu" ] || [ "$(VENDOR)" = "nv" ]; then \
+		echo "$(VENDOR) vendor, no dependencies required."; \
+	else \
+		echo "Downloading $(VENDOR_PKG) for $(VENDOR)..."; \
+		ossutil cp oss://infrahi/vector/$(VENDOR_PKG) $(ARTIFACTS_DIR)/$(VENDOR_PKG); \
+	fi
+
+# ========================
+# Docker 构建
+# ========================
+.PHONY: docker-build
+docker-build: check-vendor
+	@echo "Building Docker image: $(FULL_IMAGE)"
+	@echo "Using Dockerfile: $(DOCKERFILE)"
+	docker build -t $(FULL_IMAGE) -f $(DOCKERFILE) .
+
+# ========================
+# 推送 Harbor
+# ========================
+.PHONY: docker-push
+docker-push:
+	@echo "Pushing Docker image to Harbor..."
+	docker push $(FULL_IMAGE)
+
+# ========================
+# 同步内网仓库（仅允许在 10.107.204.10 执行）
+# ========================
+.PHONY: docker-sync
+docker-sync:
+	@HOST_IP=$$(ip route get 1 | awk '{print $$7; exit}'); \
+	if [ "$$HOST_IP" != "10.107.204.10" ]; then \
+		echo "Error: docker-sync must be executed on 10.107.204.10"; \
+		echo "Current host IP: $$HOST_IP"; \
+		exit 1; \
+	fi
+	@echo "Syncing image to inner registry..."
+	docker pull $(FULL_IMAGE)
+	docker tag $(FULL_IMAGE) $(INNER_IMAGE)
+	docker push $(INNER_IMAGE)
+
+# ========================
+# 一键发布
+# ========================
+.PHONY: release
+release: build vendor docker-build docker-push docker-sync
+	@echo "Release completed: $(FULL_IMAGE)"
+	@echo "Inner image: $(INNER_IMAGE)"
+
+# ========================
+# 清理
+# ========================
+.PHONY: clean
+clean:
+	@echo "Cleaning artifacts..."
+	rm -rf $(ARTIFACTS_DIR)/*
+
+# ========================
+# 帮助
+# ========================
+.PHONY: help
+help:
+	@echo ""
+	@echo "Vector 自定义发布流程"
+	@echo "========================"
+	@echo ""
+	@echo "用法:"
+	@echo "  make -f Makefile.release release VENDOR=mt VERSION=v0.1.5"
+	@echo ""
+	@echo "分步执行:"
+	@echo "  make -f Makefile.release build VENDOR=mt      # 编译"
+	@echo "  make -f Makefile.release vendor VENDOR=mt     # 下载依赖"
+	@echo "  make -f Makefile.release docker-build         # 构建镜像"
+	@echo "  make -f Makefile.release docker-push          # 推送 Harbor"
+	@echo "  make -f Makefile.release docker-sync          # 同步内网"
+	@echo ""
+	@echo "支持的厂商：$(SUPPORTED_VENDORS)"
+	@echo ""
+	@echo "配置变量:"
+	@echo "  VERSION        : 版本号 (默认：v0.1.5)"
+	@echo "  VENDOR         : 厂商类型 (默认：cpu)"
+	@echo "  DOCKER_REGISTRY: Harbor 地址 (默认：harbor.zhejianglab.com/zjnc-tech)"
+	@echo "  INNER_REGISTRY : 内网仓库地址 (默认：10.200.53.201:30000/moer)"
+	@echo ""
