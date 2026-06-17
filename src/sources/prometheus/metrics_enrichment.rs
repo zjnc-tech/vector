@@ -9,7 +9,7 @@ pub async fn add_metadata_to_metric(
     config: &MetadataLabelsConfig,
     honor_labels: bool,
 ) {
-    // ✅ 添加 job 标签，job_name 是必填的，直接使用
+    // 添加 job 标签，job_name 是必填的，直接使用
     let tag_name = format!("{}job", config.label_prefix);
     if !honor_labels || metric.tag_value(&tag_name).is_none() {
         metric.replace_tag(tag_name, target.job_name.clone());
@@ -91,6 +91,13 @@ pub async fn add_metadata_to_metric(
 
     // Service 元数据
     if let Some(svc_meta) = &target.service_metadata {
+        if config.service_name {
+            let tag_name = format!("{}service", config.label_prefix);
+            if !honor_labels || metric.tag_value(&tag_name).is_none() {
+                metric.replace_tag(tag_name, svc_meta.name.clone());
+            }
+        }
+
         add_labels_to_metric(
             metric,
             &svc_meta.labels,

@@ -42,23 +42,50 @@ pub struct KubernetesSdConfig {
     #[serde(default)]
     pub metadata_labels: MetadataLabelsConfig,
 
-    /// Maximum number of target batches to keep in flight while sending.
+    /// Maximum number of scraped batches to buffer before old batches are evicted.
     ///
-    /// This limits how many discovered kubelet targets can be processed concurrently before
-    /// backpressure is applied to the scrape loop.
-    #[serde(default = "default_send_batch_buffer")]
+    /// This acts as a bounded queue between scrape workers and send workers. When the queue is
+    /// full, the oldest queued batch is evicted to keep newer data flowing.
+    ///
+    /// If unset, a runtime default is derived from the current discovered target count.
+    #[serde(
+        default,
+        alias = "send_batch_buffer",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[configurable(metadata(docs::advanced))]
-    #[configurable(metadata(docs::human_name = "Send Batch Buffer"))]
-    pub send_batch_buffer: NonZeroUsize,
+    #[configurable(metadata(docs::human_name = "Send Queue Capacity"))]
+    pub send_queue_capacity: Option<NonZeroUsize>,
 
     /// Maximum number of scrape requests to keep in flight.
     ///
     /// This limits how many targets are scraped concurrently before backpressure is applied to
     /// the scrape loop.
-    #[serde(default = "default_scrape_concurrency")]
+    ///
+    /// If unset, a runtime default is derived from the current discovered target count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[configurable(metadata(docs::advanced))]
     #[configurable(metadata(docs::human_name = "Scrape Concurrency"))]
-    pub scrape_concurrency: NonZeroUsize,
+    pub scrape_concurrency: Option<NonZeroUsize>,
+
+    /// Maximum number of send workers that drain the scrape queue.
+    ///
+    /// This controls how many scraped batches can be sent downstream in parallel.
+    ///
+    /// If unset, a runtime default is derived from the current discovered target count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[configurable(metadata(docs::advanced))]
+    #[configurable(metadata(docs::human_name = "Send Worker Count"))]
+    pub send_worker_count: Option<NonZeroUsize>,
+
+    /// Timeout for sending a scraped batch downstream, in whole seconds.
+    ///
+    /// This limits how long a send worker will wait before dropping the remaining batch.
+    /// Defaults to 30 seconds.
+    #[serde(default = "default_send_timeout_secs", alias = "send_timeout")]
+    #[configurable(metadata(docs::advanced))]
+    #[configurable(metadata(docs::human_name = "Send Timeout Seconds"))]
+    pub send_timeout_secs: NonZeroUsize,
 
     /// job name to distinguish resources.
     #[serde(default)]
@@ -86,12 +113,8 @@ fn default_metrics_path() -> String {
     "/metrics".to_string()
 }
 
-fn default_send_batch_buffer() -> NonZeroUsize {
-    NonZeroUsize::new(4).expect("static")
-}
-
-fn default_scrape_concurrency() -> NonZeroUsize {
-    NonZeroUsize::new(32).expect("static")
+fn default_send_timeout_secs() -> NonZeroUsize {
+    NonZeroUsize::new(30).expect("static")
 }
 
 /// The Kubernetes resource type to use for service discovery.
@@ -120,6 +143,10 @@ pub struct MetadataLabelsConfig {
     /// Whether to add the node name as a metric label.
     #[serde(default = "default_true")]
     pub node_name: bool,
+
+    /// Whether to add the service name as a metric label.
+    #[serde(default = "default_true")]
+    pub service_name: bool,
 
     /// Whether to add the node IP as a metric label.
     #[serde(default = "default_true")]
@@ -193,6 +220,7 @@ impl Default for MetadataLabelsConfig {
             namespace: true,
             pod_name: true,
             node_name: true,
+            service_name: true,
             host_ip: true,
             pod_ip: true,
             service_labels: LabelSelector::Specific(vec![]),
@@ -273,14 +301,13 @@ pub struct K8sServiceDiscovery {
     client: Client,
     config: KubernetesSdConfig,
     targets: Arc<RwLock<Vec<DiscoveredTarget>>>,
-    // ✅ 只需要 shutdown_tx 来停止 Endpoints/Node 发现的 Watch
+    // shutdown_tx 来停止 Endpoints/Node 发现的 Watch
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
 
     node_store: Store<Node>,
-    // endpoint_store: Store<Endpoints>,
-    endpoint_slice_store: Store<EndpointSlice>,
-    pod_store: Store<Pod>,
-    service_store: Store<Service>,
+    endpoint_slice_stores: Vec<Store<EndpointSlice>>,
+    pod_stores: Vec<Store<Pod>>,
+    service_stores: Vec<Store<Service>>,
 }
 
 impl Clone for K8sServiceDiscovery {
@@ -291,10 +318,9 @@ impl Clone for K8sServiceDiscovery {
             targets: Arc::clone(&self.targets),
             shutdown_tx: Arc::clone(&self.shutdown_tx),
             node_store: self.node_store.clone(),
-            // endpoint_store: self.endpoint_store.clone(),
-            endpoint_slice_store: self.endpoint_slice_store.clone(),
-            pod_store: self.pod_store.clone(),
-            service_store: self.service_store.clone(),
+            endpoint_slice_stores: self.endpoint_slice_stores.clone(),
+            pod_stores: self.pod_stores.clone(),
+            service_stores: self.service_stores.clone(),
         }
     }
 }
@@ -333,46 +359,29 @@ impl K8sServiceDiscovery {
             Duration::from_secs(60),
         ));
 
-        let ep_slice_store_w = reflector::store::Writer::<EndpointSlice>::default();
-        let endpoint_slice_store = ep_slice_store_w.as_reader();
-        if matches!(config.role, KubernetesRole::Endpoints) {
-            tokio::spawn(custom_reflector(
-                ep_slice_store_w,
-                K8sMetaCache::new(),
-                watcher(Api::<EndpointSlice>::all(client.clone()), watcher_cfg)
-                    .backoff(watcher::DefaultBackoff::default()),
-                Duration::from_secs(30),
-            ));
-        }
+        let (endpoint_slice_stores, pod_stores, service_stores) =
+            if matches!(config.role, KubernetesRole::Endpoints) {
+                if config.namespaces.is_empty() {
+                    info!("Starting Kubernetes endpoints discovery reflectors for all namespaces");
+                } else {
+                    info!(
+                        namespaces = ?config.namespaces,
+                        "Starting namespace-scoped Kubernetes endpoints discovery reflectors"
+                    );
+                }
 
-        // Pod
-        let pod_store_w = reflector::store::Writer::<Pod>::default();
-        let pod_store = pod_store_w.as_reader();
-        if matches!(config.role, KubernetesRole::Endpoints) {
-            tokio::spawn(custom_reflector(
-                pod_store_w,
-                K8sMetaCache::new(),
-                watcher(Api::<Pod>::all(client.clone()), watcher::Config::default())
-                    .backoff(watcher::DefaultBackoff::default()),
-                Duration::from_secs(60),
-            ));
-        }
-
-        // Service
-        let svc_store_w = reflector::store::Writer::<Service>::default();
-        let service_store = svc_store_w.as_reader();
-        if matches!(config.role, KubernetesRole::Endpoints) {
-            tokio::spawn(custom_reflector(
-                svc_store_w,
-                K8sMetaCache::new(),
-                watcher(
-                    Api::<Service>::all(client.clone()),
-                    watcher::Config::default(),
+                (
+                    Self::start_endpoint_slice_reflectors(
+                        client.clone(),
+                        &config.namespaces,
+                        watcher_cfg.clone(),
+                    ),
+                    Self::start_pod_reflectors(client.clone(), &config.namespaces),
+                    Self::start_service_reflectors(client.clone(), &config.namespaces),
                 )
-                .backoff(watcher::DefaultBackoff::default()),
-                Duration::from_secs(60),
-            ));
-        }
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
 
         let discovery = Self {
             client,
@@ -380,10 +389,9 @@ impl K8sServiceDiscovery {
             targets,
             shutdown_tx: Arc::new(shutdown_tx),
             node_store,
-            // endpoint_store,
-            endpoint_slice_store,
-            pod_store,
-            service_store,
+            endpoint_slice_stores,
+            pod_stores,
+            service_stores,
         };
 
         // ✅ 初始发现
@@ -392,9 +400,6 @@ impl K8sServiceDiscovery {
 
         // ✅ 启动 Endpoints/Node 发现的 Watch（这些仍然是每个 source 独立的）
         match discovery.config.role {
-            // KubernetesRole::Endpoints => {
-            //     discovery.start_endpoints_poll_task();
-            // }
             KubernetesRole::Endpoints => {
                 discovery.start_endpoint_slices_poll_task();
             }
@@ -404,6 +409,112 @@ impl K8sServiceDiscovery {
         }
 
         Ok(discovery)
+    }
+
+    fn start_endpoint_slice_reflectors(
+        client: Client,
+        namespaces: &[String],
+        watcher_cfg: watcher::Config,
+    ) -> Vec<Store<EndpointSlice>> {
+        if namespaces.is_empty() {
+            let store_w = reflector::store::Writer::<EndpointSlice>::default();
+            let store = store_w.as_reader();
+            tokio::spawn(custom_reflector(
+                store_w,
+                K8sMetaCache::new(),
+                watcher(Api::<EndpointSlice>::all(client), watcher_cfg)
+                    .backoff(watcher::DefaultBackoff::default()),
+                Duration::from_secs(30),
+            ));
+            return vec![store];
+        }
+
+        namespaces
+            .iter()
+            .map(|namespace| {
+                let store_w = reflector::store::Writer::<EndpointSlice>::default();
+                let store = store_w.as_reader();
+                tokio::spawn(custom_reflector(
+                    store_w,
+                    K8sMetaCache::new(),
+                    watcher(
+                        Api::<EndpointSlice>::namespaced(client.clone(), namespace),
+                        watcher_cfg.clone(),
+                    )
+                    .backoff(watcher::DefaultBackoff::default()),
+                    Duration::from_secs(30),
+                ));
+                store
+            })
+            .collect()
+    }
+
+    fn start_pod_reflectors(client: Client, namespaces: &[String]) -> Vec<Store<Pod>> {
+        if namespaces.is_empty() {
+            let store_w = reflector::store::Writer::<Pod>::default();
+            let store = store_w.as_reader();
+            tokio::spawn(custom_reflector(
+                store_w,
+                K8sMetaCache::new(),
+                watcher(Api::<Pod>::all(client), watcher::Config::default())
+                    .backoff(watcher::DefaultBackoff::default()),
+                Duration::from_secs(60),
+            ));
+            return vec![store];
+        }
+
+        namespaces
+            .iter()
+            .map(|namespace| {
+                let store_w = reflector::store::Writer::<Pod>::default();
+                let store = store_w.as_reader();
+                tokio::spawn(custom_reflector(
+                    store_w,
+                    K8sMetaCache::new(),
+                    watcher(
+                        Api::<Pod>::namespaced(client.clone(), namespace),
+                        watcher::Config::default(),
+                    )
+                    .backoff(watcher::DefaultBackoff::default()),
+                    Duration::from_secs(60),
+                ));
+                store
+            })
+            .collect()
+    }
+
+    fn start_service_reflectors(client: Client, namespaces: &[String]) -> Vec<Store<Service>> {
+        if namespaces.is_empty() {
+            let store_w = reflector::store::Writer::<Service>::default();
+            let store = store_w.as_reader();
+            tokio::spawn(custom_reflector(
+                store_w,
+                K8sMetaCache::new(),
+                watcher(Api::<Service>::all(client), watcher::Config::default())
+                    .backoff(watcher::DefaultBackoff::default()),
+                Duration::from_secs(60),
+            ));
+            return vec![store];
+        }
+
+        namespaces
+            .iter()
+            .map(|namespace| {
+                let store_w = reflector::store::Writer::<Service>::default();
+                let store = store_w.as_reader();
+                tokio::spawn(custom_reflector(
+                    store_w,
+                    K8sMetaCache::new(),
+                    watcher(
+                        Api::<Service>::namespaced(client.clone(), namespace),
+                        watcher::Config::default(),
+                    )
+                    .backoff(watcher::DefaultBackoff::default()),
+                    Duration::from_secs(60),
+                ));
+                store
+            })
+            .collect()
     }
 
     pub async fn get_targets(&self) -> Vec<DiscoveredTarget> {
@@ -418,167 +529,6 @@ impl K8sServiceDiscovery {
         }
     }
 
-    // // ============================================================================
-    // // Endpoints 轮询更新
-    // // ============================================================================
-
-    // fn start_endpoints_poll_task(&self) {
-    //     let discovery = self.clone();
-    //     let mut shutdown_rx = self.shutdown_tx.subscribe();
-    //     tokio::spawn(async move {
-    //         // 每 30s 重新扫一次 store 快照，与 endpoint_store 的延迟删除窗口匹配
-    //         let mut interval = tokio::time::interval(Duration::from_secs(5));
-    //         loop {
-    //             tokio::select! {
-    //                 _ = shutdown_rx.changed() => {
-    //                     info!("Endpoints watch task shutting down");
-    //                     break;
-    //                 }
-    //                 _ = interval.tick() => {
-    //                     match discovery.discover_from_endpoints() {
-    //                         Ok(new_targets) => {
-    //                             *discovery.targets.write().await = new_targets;
-    //                         }
-    //                         Err(e) => {
-    //                             error!("Failed to refresh endpoints targets: {:?}", e);
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     });
-    // }
-
-    // fn discover_from_endpoints(&self) -> Result<Vec<DiscoveredTarget>> {
-    //     let mut all_targets = Vec::new();
-
-    //     // store.state() 返回 Arc<Endpoints> 的快照，纯内存，不 async
-    //     let all_endpoints = self.endpoint_store.state();
-    //     let allowed_ns: Option<&[String]> = if self.config.namespaces.is_empty() {
-    //         None  // 空 = 全部 namespace
-    //     } else {
-    //         Some(&self.config.namespaces)
-    //     };
-
-    //     for ep in all_endpoints {
-    //         // namespace 过滤
-    //         let ep_ns = match ep.metadata.namespace.as_deref() {
-    //             Some(ns) => ns,
-    //             None => continue,
-    //         };
-    //         if let Some(allowed) = allowed_ns {
-    //             if !allowed.iter().any(|n| n == ep_ns) {
-    //                 continue;
-    //             }
-    //         }
-
-    //         let targets = self.discover_from_endpoints_internal(&ep)?;
-    //         all_targets.extend(targets);
-    //     }
-
-    //     Ok(all_targets)
-    // }
-
-    // fn discover_from_endpoints_internal(
-    //     &self,
-    //     endpoints: &Endpoints,
-    // ) -> Result<Vec<DiscoveredTarget>> {
-    //     let mut targets = Vec::new();
-    //     let endpoints_name = match endpoints.metadata.name.as_deref() {
-    //         Some(n) => n,
-    //         None => return Ok(targets),
-    //     };
-    //     let namespace = match endpoints.metadata.namespace.as_deref() {
-    //         Some(ns) => ns,
-    //         None => return Ok(targets),
-    //     };
-    //     // ─── Service 元数据（从 store，同步）───
-    //     let service_metadata = self.service_store
-    //         .get(&ObjectRef::<Service>::new(endpoints_name).within(namespace))
-    //         .map(|s| Arc::new(ServiceMetadata {
-    //             name: s.metadata.name.clone().unwrap_or_default(),
-    //             namespace: s.metadata.namespace.clone().unwrap_or_default(),
-    //             labels: s.metadata.labels.clone().unwrap_or_default(),
-    //             annotations: s.metadata.annotations.clone().unwrap_or_default(),
-    //         }));
-
-    //     let Some(subsets) = &endpoints.subsets else { return Ok(targets) };
-    //     for subset in subsets {
-    //         let Some(addresses) = &subset.addresses else { continue };
-    //         let Some(ports) = &subset.ports else { continue };
-
-    //         for address in addresses {
-    //             // ─── Pod / Node 元数据（从 store，同步）───
-    //             let (pod_metadata, node_metadata) = if let Some(r) = &address.target_ref {
-    //                 if r.kind.as_deref() == Some("Pod") {
-    //                     if let Some(pod_name) = &r.name {
-    //                         let pod = self.pod_store
-    //                             .get(&ObjectRef::<Pod>::new(pod_name).within(namespace));
-
-    //                         let pod_meta = pod.as_ref().map(|p| Arc::new(PodMetadata {
-    //                             name: p.metadata.name.clone().unwrap_or_default(),
-    //                             namespace: p.metadata.namespace.clone().unwrap_or_default(),
-    //                             labels: p.metadata.labels.clone().unwrap_or_default(),
-    //                             annotations: p.metadata.annotations.clone().unwrap_or_default(),
-    //                             pod_ip: p.status.as_ref().and_then(|s| s.pod_ip.clone()),
-    //                         }));
-
-    //                         // node_name 来自 Pod.spec.node_name
-    //                         let node_meta = pod.as_ref()
-    //                             .and_then(|p| p.spec.as_ref()?.node_name.as_ref().map(|n| n.clone()))
-    //                             .and_then(|node_name| {
-    //                                 self.node_store.get(&ObjectRef::<Node>::new(&node_name))
-    //                                     .map(|n| {
-    //                                         let node_ip = n.status.as_ref()
-    //                                             .and_then(|s| s.addresses.as_ref())
-    //                                             .and_then(|a| a.iter().find(|a| a.type_ == "InternalIP"))
-    //                                             .map(|a| a.address.clone());
-    //                                         Arc::new(NodeMetadata {
-    //                                             name: node_name,
-    //                                             labels: n.metadata.labels.clone().unwrap_or_default(),
-    //                                             node_ip,
-    //                                         })
-    //                                     })
-    //                             });
-
-    //                         (pod_meta, node_meta)
-    //                     } else { (None, None) }
-    //                 } else { (None, None) }
-    //             } else { (None, None) };
-
-    //             for port in ports {
-    //                  if let Some(ref port_filter) = self.config.port {
-    //                     let port_matches = if let Ok(port_num) = port_filter.parse::<i32>() {
-    //                         port.port == port_num
-    //                     } else {
-    //                         port.name.as_deref() == Some(port_filter.as_str())
-    //                     };
-
-    //                     if !port_matches {
-    //                         continue;
-    //                     }
-    //                 }
-    //                 // port 过滤
-    //                 let url = format!(
-    //                     "{}://{}:{}{}",
-    //                     self.config.scheme,
-    //                     address.ip,
-    //                     port.port,
-    //                     self.config.metrics_path
-    //                 );
-
-    //                 targets.push(DiscoveredTarget {
-    //                     url,
-    //                     job_name: self.config.job_name.clone(),
-    //                     pod_metadata: pod_metadata.clone(),
-    //                     node_metadata: node_metadata.clone(),
-    //                     service_metadata: service_metadata.clone(),
-    //                 });
-    //             }
-    //         }
-    //     }
-    //     Ok(targets)
-    // }
     fn start_endpoint_slices_poll_task(&self) {
         let discovery = self.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -608,28 +558,45 @@ impl K8sServiceDiscovery {
     fn discover_from_endpoint_slices(&self) -> Result<Vec<DiscoveredTarget>> {
         let mut all_targets = Vec::new();
 
-        let all_slices = self.endpoint_slice_store.state();
         let allowed_ns: Option<&[String]> = if self.config.namespaces.is_empty() {
             None
         } else {
             Some(&self.config.namespaces)
         };
 
-        for slice in all_slices {
-            let slice_ns = match slice.metadata.namespace.as_deref() {
-                Some(ns) => ns,
-                None => continue,
-            };
-            if let Some(allowed) = allowed_ns {
-                if !allowed.iter().any(|n| n == slice_ns) {
-                    continue;
+        for store in &self.endpoint_slice_stores {
+            for slice in store.state() {
+                let slice_ns = match slice.metadata.namespace.as_deref() {
+                    Some(ns) => ns,
+                    None => continue,
+                };
+                if let Some(allowed) = allowed_ns {
+                    if !allowed.iter().any(|n| n == slice_ns) {
+                        continue;
+                    }
                 }
+                let targets = self.discover_from_endpoint_slice_internal(&slice)?;
+                all_targets.extend(targets);
             }
-            let targets = self.discover_from_endpoint_slice_internal(&slice)?;
-            all_targets.extend(targets);
         }
 
         Ok(all_targets)
+    }
+
+    fn get_service(&self, name: &str, namespace: &str) -> Option<Arc<Service>> {
+        self.service_stores
+            .iter()
+            .find_map(|store| store.get(&ObjectRef::<Service>::new(name).within(namespace)))
+    }
+
+    fn get_pod(&self, name: &str, namespace: &str) -> Option<Arc<Pod>> {
+        self.pod_stores
+            .iter()
+            .find_map(|store| store.get(&ObjectRef::<Pod>::new(name).within(namespace)))
+    }
+
+    fn get_node(&self, name: &str) -> Option<Arc<Node>> {
+        self.node_store.get(&ObjectRef::<Node>::new(name))
     }
 
     fn discover_from_endpoint_slice_internal(
@@ -654,17 +621,14 @@ impl K8sServiceDiscovery {
             None => return Ok(targets),
         };
 
-        let service_metadata = self
-            .service_store
-            .get(&ObjectRef::<Service>::new(service_name).within(namespace))
-            .map(|s| {
-                Arc::new(ServiceMetadata {
-                    name: s.metadata.name.clone().unwrap_or_default(),
-                    namespace: s.metadata.namespace.clone().unwrap_or_default(),
-                    labels: s.metadata.labels.clone().unwrap_or_default(),
-                    annotations: s.metadata.annotations.clone().unwrap_or_default(),
-                })
-            });
+        let service_metadata = self.get_service(service_name, namespace).map(|s| {
+            Arc::new(ServiceMetadata {
+                name: s.metadata.name.clone().unwrap_or_default(),
+                namespace: s.metadata.namespace.clone().unwrap_or_default(),
+                labels: s.metadata.labels.clone().unwrap_or_default(),
+                annotations: s.metadata.annotations.clone().unwrap_or_default(),
+            })
+        });
 
         // EndpointSlice 的 ports 在顶层
         let ports = match &slice.ports {
@@ -688,36 +652,32 @@ impl K8sServiceDiscovery {
                     return None;
                 }
                 let pod_name = r.name.as_deref()?;
-                self.pod_store
-                    .get(&ObjectRef::<Pod>::new(pod_name).within(namespace))
-                    .map(|p| {
-                        Arc::new(PodMetadata {
-                            name: p.metadata.name.clone().unwrap_or_default(),
-                            namespace: p.metadata.namespace.clone().unwrap_or_default(),
-                            labels: p.metadata.labels.clone().unwrap_or_default(),
-                            annotations: p.metadata.annotations.clone().unwrap_or_default(),
-                            pod_ip: p.status.as_ref().and_then(|s| s.pod_ip.clone()),
-                        })
+                self.get_pod(pod_name, namespace).map(|p| {
+                    Arc::new(PodMetadata {
+                        name: p.metadata.name.clone().unwrap_or_default(),
+                        namespace: p.metadata.namespace.clone().unwrap_or_default(),
+                        labels: p.metadata.labels.clone().unwrap_or_default(),
+                        annotations: p.metadata.annotations.clone().unwrap_or_default(),
+                        pod_ip: p.status.as_ref().and_then(|s| s.pod_ip.clone()),
                     })
+                })
             });
 
             // EndpointSlice 直接带 node_name，无需再通过 Pod 二次查询
             let node_metadata = endpoint.node_name.as_deref().and_then(|node_name| {
-                self.node_store
-                    .get(&ObjectRef::<Node>::new(node_name))
-                    .map(|n| {
-                        let node_ip = n
-                            .status
-                            .as_ref()
-                            .and_then(|s| s.addresses.as_ref())
-                            .and_then(|a| a.iter().find(|a| a.type_ == "InternalIP"))
-                            .map(|a| a.address.clone());
-                        Arc::new(NodeMetadata {
-                            name: node_name.to_string(),
-                            labels: n.metadata.labels.clone().unwrap_or_default(),
-                            node_ip,
-                        })
+                self.get_node(node_name).map(|n| {
+                    let node_ip = n
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.addresses.as_ref())
+                        .and_then(|a| a.iter().find(|a| a.type_ == "InternalIP"))
+                        .map(|a| a.address.clone());
+                    Arc::new(NodeMetadata {
+                        name: node_name.to_string(),
+                        labels: n.metadata.labels.clone().unwrap_or_default(),
+                        node_ip,
                     })
+                })
             });
 
             for ip in &endpoint.addresses {
