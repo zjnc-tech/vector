@@ -38,6 +38,17 @@ pub struct KubernetesSdConfig {
     #[serde(default)]
     pub field_selector: Option<String>,
 
+    /// Whether to scrape endpoints even when the EndpointSlice marks them as not ready.
+    ///
+    /// This can be useful for exporters that remain reachable after a node becomes NotReady,
+    /// but it may increase scrape errors for endpoints that are intentionally drained.
+    #[serde(
+        default = "crate::serde::default_false",
+        skip_serializing_if = "crate::serde::is_default"
+    )]
+    #[configurable(metadata(docs::advanced))]
+    pub include_not_ready_endpoints: bool,
+
     /// Configuration for metadata labels to add to metrics.
     #[serde(default)]
     pub metadata_labels: MetadataLabelsConfig,
@@ -637,13 +648,13 @@ impl K8sServiceDiscovery {
         };
 
         for endpoint in &slice.endpoints {
-            // 只抓 ready 状态的 endpoint
+            // 默认只抓 ready 状态的 endpoint，避免把已经从 Service 流量中摘掉的后端也纳入抓取。
             let ready = endpoint
                 .conditions
                 .as_ref()
                 .and_then(|c| c.ready)
                 .unwrap_or(true);
-            if !ready {
+            if !self.config.include_not_ready_endpoints && !ready {
                 continue;
             }
 
