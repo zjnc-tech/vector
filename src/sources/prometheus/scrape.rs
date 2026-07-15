@@ -6,7 +6,7 @@ use http::{response::Parts, Uri};
 use serde_with::serde_as;
 use snafu::ResultExt;
 use vector_lib::configurable::configurable_component;
-use vector_lib::{config::LogNamespace, event::{Event}};
+use vector_lib::{config::LogNamespace, event::Event};
 
 use super::parser;
 use crate::http::QueryParameters;
@@ -27,12 +27,10 @@ use crate::{
     Result,
 };
 
-use typetag::serde;
-use std::collections::HashMap;
-use super::k8s_discovery::{
-    KubernetesSdConfig,
-};
+use super::k8s_discovery::KubernetesSdConfig;
 use super::k8s_scraper::K8sScraper;
+use std::collections::HashMap;
+use typetag::serde;
 
 // pulled up, and split over multiple lines, because the long lines trip up rustfmt such that it
 // gave up trying to format, but reported no error
@@ -53,7 +51,7 @@ pub struct PrometheusScrapeConfig {
     /// Endpoints to scrape metrics from.
     #[configurable(metadata(docs::examples = "http://localhost:9090/metrics"))]
     #[serde(alias = "hosts")]
-    #[serde(default)] 
+    #[serde(default)]
     endpoints: Vec<String>,
 
     /// The interval between scrapes. Requests are run concurrently so if a scrape takes longer
@@ -118,7 +116,7 @@ pub struct PrometheusScrapeConfig {
     /// such as pods, services, or endpoints.
     #[serde(default)]
     #[configurable(metadata(docs::advanced))]
-    pub kubernetes_sd: Option<KubernetesSdConfig>,  // 使用导入的类型
+    pub kubernetes_sd: Option<KubernetesSdConfig>, // 使用导入的类型
 }
 
 fn query_example() -> serde_json::Value {
@@ -153,7 +151,7 @@ impl GenerateConfig for PrometheusScrapeConfig {
 impl SourceConfig for PrometheusScrapeConfig {
     async fn build(&self, cx: SourceContext) -> Result<sources::Source> {
         // ====== 修改点 1: 改变 urls 的获取方式 ======
-       if let Some(ref k8s_config) = self.kubernetes_sd {
+        if let Some(ref k8s_config) = self.kubernetes_sd {
             // Kubernetes 服务发现模式
             self.build_k8s_scraper(k8s_config, cx).await
         } else {
@@ -189,7 +187,6 @@ impl SourceConfig for PrometheusScrapeConfig {
 
             Ok(call(inputs, builder, cx.out, HttpMethod::Get).boxed())
         }
-
     }
 
     fn outputs(&self, _global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
@@ -228,7 +225,7 @@ impl PrometheusScrapeConfig {
         k8s_config: &KubernetesSdConfig,
         cx: SourceContext,
     ) -> Result<sources::Source> {
-            let scraper = K8sScraper::new(
+        let scraper = K8sScraper::new(
             k8s_config.clone(),
             self.tls.clone(),
             self.auth.clone(),
@@ -238,17 +235,17 @@ impl PrometheusScrapeConfig {
             self.instance_tag.clone(),
             self.endpoint_tag.clone(),
             &cx.proxy,
-        ).await?;
-        
+        )
+        .await?;
+
         let interval = self.interval;
         let shutdown = cx.shutdown;
         let out = cx.out;
-        
+
         Ok(Box::pin(async move {
             scraper.run(interval, shutdown, out).await
         }))
     }
-    
 }
 /// Captures the configuration options required to build request-specific context.
 #[derive(Clone)]
