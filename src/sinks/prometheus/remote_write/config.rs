@@ -1,4 +1,5 @@
-use http::Uri;
+use http::{header::AUTHORIZATION, HeaderName, HeaderValue, Uri};
+use indexmap::IndexMap;
 use snafu::prelude::*;
 
 use crate::{
@@ -81,7 +82,7 @@ pub struct RemoteWriteConfig {
 
     #[configurable(derived)]
     #[serde(default)]
-    pub request: TowerRequestConfig,
+    pub request: RemoteWriteRequestConfig,
 
     /// The tenant ID to send.
     ///
@@ -125,6 +126,45 @@ const fn default_compression() -> Compression {
 
 impl_generate_config_from_default!(RemoteWriteConfig);
 
+/// Outbound HTTP request settings for the Prometheus remote write sink.
+#[configurable_component]
+#[derive(Clone, Debug, Default)]
+#[serde(default)]
+pub struct RemoteWriteRequestConfig {
+    #[serde(flatten)]
+    pub tower: TowerRequestConfig,
+
+    /// Additional HTTP headers to add to every HTTP request.
+    ///
+    /// Values are applied verbatim; template expansion is not supported.
+    #[serde(default)]
+    #[configurable(metadata(
+        docs::additional_props_description = "An HTTP request header and its static value."
+    ))]
+    #[configurable(metadata(docs::examples = "remote_write_headers_examples()"))]
+    pub headers: IndexMap<String, String>,
+}
+
+fn remote_write_headers_examples() -> IndexMap<String, String> {
+    IndexMap::from_iter([
+        ("Accept".to_string(), "text/plain".to_string()),
+        ("X-My-Custom-Header".to_string(), "A-Value".to_string()),
+    ])
+}
+
+fn validate_headers(
+    headers: &IndexMap<String, String>,
+    configures_auth: bool,
+) -> crate::Result<IndexMap<HeaderName, HeaderValue>> {
+    let headers = crate::sinks::util::http::validate_headers(headers)?;
+
+    if configures_auth && headers.contains_key(&AUTHORIZATION) {
+        return Err("Authorization header can not be used with defined auth options".into());
+    }
+
+    Ok(headers)
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "prometheus_remote_write")]
 impl SinkConfig for RemoteWriteConfig {
@@ -135,7 +175,8 @@ impl SinkConfig for RemoteWriteConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let endpoint = self.endpoint.parse::<Uri>().context(UriParseSnafu)?;
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
-        let request_settings = self.request.into_settings();
+        let request_settings = self.request.tower.into_settings();
+        let headers = validate_headers(&self.request.headers, self.auth.is_some())?;
         let buckets = self.buckets.clone();
         let quantiles = self.quantiles.clone();
         let default_namespace = self.default_namespace.clone();
@@ -177,6 +218,7 @@ impl SinkConfig for RemoteWriteConfig {
             client.clone(),
             endpoint.clone(),
             self.compression,
+            headers.clone(),
             auth.clone(),
         )
         .boxed();
@@ -186,6 +228,7 @@ impl SinkConfig for RemoteWriteConfig {
             client,
             auth,
             compression: self.compression,
+            headers,
         };
         let service = ServiceBuilder::new()
             .settings(request_settings, http_response_retry_logic())
@@ -218,11 +261,20 @@ async fn healthcheck(
     client: HttpClient,
     endpoint: Uri,
     compression: Compression,
+    headers: indexmap::IndexMap<http::HeaderName, http::HeaderValue>,
     auth: Option<Auth>,
 ) -> crate::Result<()> {
     let body = bytes::Bytes::new();
-    let request =
-        build_request(http::Method::GET, &endpoint, compression, body, None, auth).await?;
+    let request = build_request(
+        http::Method::GET,
+        &endpoint,
+        compression,
+        body,
+        None,
+        &headers,
+        auth,
+    )
+    .await?;
     let response = client.send(request).await?;
 
     match response.status() {

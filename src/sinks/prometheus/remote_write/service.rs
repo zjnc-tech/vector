@@ -6,7 +6,8 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_types::region::Region;
 
 use bytes::Bytes;
-use http::Uri;
+use http::{HeaderName, HeaderValue, Uri};
+use indexmap::IndexMap;
 
 use super::request_builder::RemoteWriteRequest;
 use crate::{
@@ -35,6 +36,7 @@ pub(super) struct RemoteWriteService {
     pub(super) auth: Option<Auth>,
     pub(super) client: HttpClient,
     pub(super) compression: super::Compression,
+    pub(super) headers: IndexMap<HeaderName, HeaderValue>,
 }
 
 impl Service<RemoteWriteRequest> for RemoteWriteService {
@@ -52,6 +54,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
         let endpoint = self.endpoint.clone();
         let auth = self.auth.clone();
         let compression = self.compression;
+        let headers = self.headers.clone();
 
         Box::pin(async move {
             let metadata = std::mem::take(request.metadata_mut());
@@ -64,6 +67,7 @@ impl Service<RemoteWriteRequest> for RemoteWriteService {
                 compression,
                 request.request,
                 request.tenant_id.as_ref(),
+                &headers,
                 auth,
             )
             .await?;
@@ -106,6 +110,7 @@ pub(super) async fn build_request(
     compression: Compression,
     body: Bytes,
     tenant_id: Option<&String>,
+    headers: &IndexMap<HeaderName, HeaderValue>,
     auth: Option<Auth>,
 ) -> crate::Result<http::Request<hyper::Body>> {
     let mut builder = http::Request::builder()
@@ -123,6 +128,10 @@ pub(super) async fn build_request(
     }
 
     let mut request = builder.body(body)?;
+
+    for (name, value) in headers {
+        request.headers_mut().insert(name, value.clone());
+    }
 
     if let Some(auth) = auth {
         match auth {

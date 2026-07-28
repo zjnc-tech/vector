@@ -52,6 +52,72 @@ async fn sends_request() {
 }
 
 #[tokio::test]
+async fn sends_custom_headers() {
+    let outputs = send_request(
+        indoc! {r#"
+            [request.headers]
+            X-Custom-Header = "value"
+            X-Scope-OrgID = "custom-tenant"
+            "#},
+        vec![create_event("gauge-2".into(), 32.0)],
+    )
+    .await;
+
+    let (headers, _) = &outputs[0];
+    assert_eq!(headers["x-custom-header"], "value");
+    assert_eq!(headers["x-scope-orgid"], "custom-tenant");
+}
+
+#[tokio::test]
+async fn healthcheck_sends_custom_headers() {
+    let addr = test_util::next_addr();
+    let (mut rx, trigger, server) = build_test_server(addr);
+    tokio::spawn(server);
+
+    let config: RemoteWriteConfig = toml::from_str(&format!(
+        "endpoint = \"http://{addr}/write\"\n[request.headers]\nX-Custom-Header = \"value\""
+    ))
+    .unwrap();
+    let (_, healthcheck) = config.build(SinkContext::default()).await.unwrap();
+    healthcheck.await.unwrap();
+
+    let (parts, _) = rx.next().await.unwrap();
+    assert_eq!(parts.method, "GET");
+    assert_eq!(parts.headers["x-custom-header"], "value");
+    drop(trigger);
+}
+
+#[tokio::test]
+async fn rejects_invalid_custom_headers() {
+    let config: RemoteWriteConfig = toml::from_str(
+        "endpoint = \"http://localhost:9000/write\"\n[request.headers]\n\"invalid header\" = \"value\"",
+    )
+    .unwrap();
+
+    assert!(config.build(SinkContext::default()).await.is_err());
+}
+
+#[tokio::test]
+async fn rejects_invalid_custom_header_values() {
+    let config: RemoteWriteConfig = toml::from_str(
+        "endpoint = \"http://localhost:9000/write\"\n[request.headers]\nX-Custom-Header = \"invalid\\nvalue\"",
+    )
+    .unwrap();
+
+    assert!(config.build(SinkContext::default()).await.is_err());
+}
+
+#[tokio::test]
+async fn rejects_authorization_header_with_auth() {
+    let config: RemoteWriteConfig = toml::from_str(
+        "endpoint = \"http://localhost:9000/write\"\n[request.headers]\nAuthorization = \"Bearer token\"\n[auth]\nstrategy = \"basic\"\nuser = \"user\"\npassword = \"password\"",
+    )
+    .unwrap();
+
+    assert!(config.build(SinkContext::default()).await.is_err());
+}
+
+#[tokio::test]
 async fn sends_authenticated_request() {
     let outputs = send_request(
         indoc! {r#"
