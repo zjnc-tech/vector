@@ -1,0 +1,13 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates iputils-ping dnsutils curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ./target/x86_64-unknown-linux-gnu/release/vector /usr/local/bin/vector
+
+RUN chmod +x /usr/local/bin/vector
+
+EXPOSE 8686
+
+ENTRYPOINT ["/usr/local/bin/vector"]
