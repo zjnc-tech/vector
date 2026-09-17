@@ -15,7 +15,14 @@ LABEL org.opencontainers.image.documentation="https://vector.dev/docs"
 
 # we want the latest versions of these
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata systemd liblldpctl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    tzdata \
+    systemd \
+    liblldpctl-dev \
+    procps \
+    kmod \
+    pciutils \
+    && rm -rf /var/lib/apt/lists/*
 COPY moer.tar.gz /opt/moer.tar.gz
 RUN tar -xvf /opt/moer.tar.gz -C /opt
 RUN rm -rf /opt/moer.tar.gz
