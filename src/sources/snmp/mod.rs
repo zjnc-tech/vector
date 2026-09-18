@@ -11,6 +11,21 @@ use vector_lib::lookup::owned_value_path;
 use vector_lib::{config::DataType, schema};
 use vrl::value::Kind;
 
+/// SNMP 协议版本，决定底层命令走 v1/v2c 还是 v3 那套认证参数
+#[configurable_component]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SnmpVersion {
+    /// SNMPv1，使用 community 字符串认证
+    V1,
+
+    /// SNMPv2c，使用 community 字符串认证
+    V2c,
+
+    /// SNMPv3，使用用户名与安全级别认证
+    V3,
+}
+
 /// 表示单个集群的配置
 #[configurable_component]
 #[derive(Clone, Debug)]
@@ -23,21 +38,35 @@ pub struct SnmpClusterConfig {
     #[configurable(description = "List of switch management IPs or hostnames for this cluster")]
     pub targets: Vec<String>,
 
-    /// SNMP v3用户名
-    #[configurable(description = "SNMP v3 username for this cluster")]
-    pub user: String,
+    /// SNMP 协议版本: v1 | v2c | v3，默认 v3
+    #[serde(default = "default_version")]
+    #[configurable(derived)]
+    pub version: SnmpVersion,
+
+    /// SNMP v1/v2c community 字符串, 仅 v1/v2c 时需要
+    #[serde(default)]
+    #[configurable(description = "SNMP v1/v2c community string, required for v1/v2c")]
+    pub community: Option<String>,
+
+    /// SNMP v3用户名, 仅 v3 时需要
+    #[serde(default)]
+    #[configurable(description = "SNMP v3 username for this cluster, required for v3")]
+    pub user: Option<String>,
 
     /// SNMP v3认证协议 (MD5 or SHA)
+    #[serde(default)]
     #[configurable(description = "SNMP v3 authentication protocol (MD5 or SHA)")]
-    pub auth_protocol: String,
+    pub auth_protocol: Option<String>,
 
     /// SNMP v3认证密码
+    #[serde(default)]
     #[configurable(description = "SNMP v3 authentication password")]
-    pub auth_password: String,
+    pub auth_password: Option<String>,
 
-    /// SNMP v3安全级别: noAuthNoPriv | authNoPriv | authPriv
+    /// SNMP v3安全级别: noAuthNoPriv | authNoPriv | authPriv, 仅 v3 时需要
+    #[serde(default)]
     #[configurable(description = "SNMP v3 security level: noAuthNoPriv | authNoPriv | authPriv")]
-    pub security_level: String,
+    pub security_level: Option<String>,
 
     /// SNMP v3隐私协议 (AES/DES), 仅authPriv时需要
     #[serde(default)]
@@ -66,6 +95,11 @@ pub struct SnmpSwitchLldpConfig {
 
 const fn default_interval() -> u64 {
     60
+}
+
+// 默认保持 v3，避免已有配置在不感知 version 的情况下语义发生变化
+const fn default_version() -> SnmpVersion {
+    SnmpVersion::V3
 }
 
 #[derive(Debug, Clone)]
@@ -104,13 +138,21 @@ impl SourceConfig for SnmpSwitchLldpConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let shutdown = cx.shutdown.clone();
         let out = cx.out;
-        let clusters = self.clusters.clone();
+        // 先把认证参数收敛成传输配置，版本与参数不匹配时直接在构建阶段失败
+        let clusters = self
+            .clusters
+            .iter()
+            .map(|cluster_config| {
+                SnmpTransport::from_cluster(cluster_config)
+                    .map(|transport| (cluster_config.clone(), transport))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
 
         Ok(Box::pin(async move {
             let mut cluster_handles = Vec::new();
 
             // 为每个集群启动一个独立的任务
-            for cluster_config in clusters {
+            for (cluster_config, transport) in clusters {
                 let mut out_clone = out.clone(); // 需要可变引用以发送批次
                 let shutdown_clone = shutdown.clone();
 
@@ -122,6 +164,7 @@ impl SourceConfig for SnmpSwitchLldpConfig {
                             _ = tokio::time::sleep(Duration::from_secs(cluster_config.scrape_interval_secs)) => {
                                 let cluster_logs = collect_cluster_data_with_config(
                                     &cluster_config,
+                                    &transport,
                                 ).await;
 
                                 if let Err(e) = out_clone.send_batch(cluster_logs).await {
@@ -235,23 +278,21 @@ impl SourceConfig for SnmpSwitchLldpConfig {
 }
 
 // 新增函数：使用集群特定配置采集数据
-async fn collect_cluster_data_with_config(cluster_config: &SnmpClusterConfig) -> Vec<LogEvent> {
+async fn collect_cluster_data_with_config(
+    cluster_config: &SnmpClusterConfig,
+    transport: &SnmpTransport,
+) -> Vec<LogEvent> {
     let mut all_logs = Vec::new();
 
     // 初始化集群中的目标
-    let targets = init_targets(&cluster_config.targets, cluster_config).await;
+    let targets = init_targets(&cluster_config.targets, transport).await;
 
     // 并发采集集群中每个目标的数据
     let mut tasks = Vec::new();
     for target in &targets {
         let task = tokio::spawn(collect_single_target_with_config(
             target.clone(),
-            cluster_config.user.clone(),
-            cluster_config.auth_protocol.clone(),
-            cluster_config.auth_password.clone(),
-            cluster_config.security_level.clone(),
-            cluster_config.priv_protocol.clone(),
-            cluster_config.priv_password.clone(),
+            transport.clone(),
             cluster_config.name.clone(),
         ));
         tasks.push(task);
@@ -270,22 +311,13 @@ async fn collect_cluster_data_with_config(cluster_config: &SnmpClusterConfig) ->
 }
 
 // 初始化目标
-async fn init_targets(targets: &[String], cluster_config: &SnmpClusterConfig) -> Vec<Target> {
+async fn init_targets(targets: &[String], transport: &SnmpTransport) -> Vec<Target> {
     let mut result = Vec::new();
 
     for ip in targets {
-        let sys_descr = snmp_get(
-            ip,
-            &cluster_config.user,
-            &cluster_config.auth_protocol,
-            &cluster_config.auth_password,
-            &cluster_config.security_level,
-            &cluster_config.priv_protocol,
-            &cluster_config.priv_password,
-            "1.3.6.1.2.1.1.1.0",
-        )
-        .await
-        .unwrap_or_default();
+        let sys_descr = snmp_get(transport, ip, "1.3.6.1.2.1.1.1.0")
+            .await
+            .unwrap_or_default();
 
         let vendor = detect_vendor(&sys_descr);
 
@@ -306,26 +338,10 @@ async fn init_targets(targets: &[String], cluster_config: &SnmpClusterConfig) ->
 // 修改函数签名以接受配置参数
 async fn collect_single_target_with_config(
     target: Target,
-    user: String,
-    auth_protocol: String,
-    auth_password: String,
-    security_level: String,
-    priv_protocol: Option<String>,
-    priv_password: Option<String>,
+    transport: SnmpTransport,
     cluster_name: String,
 ) -> Result<Vec<LogEvent>, String> {
-    match collect_lldp_from_switch(
-        &target,
-        &user,
-        &auth_protocol,
-        &auth_password,
-        &security_level,
-        &priv_protocol,
-        &priv_password,
-        &cluster_name,
-    )
-    .await
-    {
+    match collect_lldp_from_switch(&target, &transport, &cluster_name).await {
         Ok((interfaces, neighbors)) => {
             let logs = neighbors_to_logs(interfaces, neighbors, &cluster_name, &target.ip);
             Ok(logs)
@@ -373,12 +389,7 @@ const SYS_NAME: &str = "1.3.6.1.2.1.1.5.0";
 // ----------------- Collect LLDP -----------------
 async fn collect_lldp_from_switch(
     target: &Target,
-    user: &str,
-    auth_protocol: &str,
-    auth_password: &str,
-    security_level: &str,
-    priv_protocol: &Option<String>,
-    priv_password: &Option<String>,
+    transport: &SnmpTransport,
     cluster_name: &str,
 ) -> Result<(Vec<LocalInterface>, Vec<LldpNeighbor>), String> {
     debug!(
@@ -388,67 +399,22 @@ async fn collect_lldp_from_switch(
 
     let oids = lldp_oids(&target.vendor);
 
-    let local_device = snmp_get(
-        &target.ip,
-        user,
-        auth_protocol,
-        auth_password,
-        security_level,
-        priv_protocol,
-        priv_password,
-        SYS_NAME,
-    )
-    .await?;
+    let local_device = snmp_get(transport, &target.ip, SYS_NAME).await?;
 
     // 获取本地所有端口信息
     let local_ports = snmpwalk_kv(
+        transport,
         &target.ip,
-        user,
-        auth_protocol,
-        auth_password,
-        security_level,
-        priv_protocol,
-        priv_password,
         "1.3.6.1.2.1.2.2.1.2", // ifDescr OID - 获取所有接口描述
     )
     .await?;
 
     // 获取LLDP本地端口信息
-    let lldp_loc_ports = snmpwalk_kv(
-        &target.ip,
-        user,
-        auth_protocol,
-        auth_password,
-        security_level,
-        priv_protocol,
-        priv_password,
-        oids.loc_port,
-    )
-    .await?;
+    let lldp_loc_ports = snmpwalk_kv(transport, &target.ip, oids.loc_port).await?;
 
-    let rem_sys = snmpwalk_kv(
-        &target.ip,
-        user,
-        auth_protocol,
-        auth_password,
-        security_level,
-        priv_protocol,
-        priv_password,
-        oids.rem_sys,
-    )
-    .await?;
+    let rem_sys = snmpwalk_kv(transport, &target.ip, oids.rem_sys).await?;
 
-    let rem_port = snmpwalk_kv(
-        &target.ip,
-        user,
-        auth_protocol,
-        auth_password,
-        security_level,
-        priv_protocol,
-        priv_password,
-        oids.rem_port,
-    )
-    .await?;
+    let rem_port = snmpwalk_kv(transport, &target.ip, oids.rem_port).await?;
 
     let mut interfaces = Vec::new();
     let mut neighbors = Vec::new();
@@ -491,118 +457,159 @@ async fn collect_lldp_from_switch(
 }
 
 // ----------------- SNMP helpers -----------------
-fn build_snmpv3_args(
-    user: &str,
-    auth_protocol: &str,
-    auth_password: &str,
-    security_level: &str,
-    priv_protocol: &Option<String>,
-    priv_password: &Option<String>,
-) -> Result<Vec<String>, String> {
-    let mut args = vec![
-        "-v3".into(),
-        "-l".into(),
-        security_level.into(),
-        "-u".into(),
-        user.into(),
-    ];
-
-    match security_level {
-        "noAuthNoPriv" => {}
-        "authNoPriv" => {
-            args.extend([
-                "-a".into(),
-                auth_protocol.into(),
-                "-A".into(),
-                auth_password.into(),
-            ]);
-        }
-        "authPriv" => {
-            let proto = priv_protocol
-                .as_ref()
-                .ok_or("priv_protocol required for authPriv")?;
-            let pass = priv_password
-                .as_ref()
-                .ok_or("priv_password required for authPriv")?;
-
-            args.extend([
-                "-a".into(),
-                auth_protocol.into(),
-                "-A".into(),
-                auth_password.into(),
-                "-x".into(),
-                proto.clone(),
-                "-X".into(),
-                pass.clone(),
-            ]);
-        }
-        _ => return Err(format!("invalid security_level: {}", security_level)),
-    }
-
-    Ok(args)
+/// 一次 SNMP 请求所需的传输参数，已从集群配置中收敛并校验完成
+#[derive(Clone, Debug)]
+struct SnmpTransport {
+    version: SnmpVersion,
+    community: Option<String>,
+    user: Option<String>,
+    auth_protocol: Option<String>,
+    auth_password: Option<String>,
+    security_level: Option<String>,
+    priv_protocol: Option<String>,
+    priv_password: Option<String>,
 }
 
-async fn snmp_get(
-    target: &str,
-    user: &str,
-    auth_protocol: &str,
-    auth_password: &str,
-    security_level: &str,
-    priv_protocol: &Option<String>,
-    priv_password: &Option<String>,
-    oid: &str,
-) -> Result<String, String> {
-    let mut args = build_snmpv3_args(
-        user,
-        auth_protocol,
-        auth_password,
-        security_level,
-        priv_protocol,
-        priv_password,
-    )?;
+impl SnmpTransport {
+    /// 从集群配置中收敛认证参数，并在启动采集前完成一次参数合法性校验
+    fn from_cluster(cluster_config: &SnmpClusterConfig) -> Result<Self, String> {
+        let transport = Self {
+            version: cluster_config.version,
+            community: cluster_config.community.clone(),
+            user: cluster_config.user.clone(),
+            auth_protocol: cluster_config.auth_protocol.clone(),
+            auth_password: cluster_config.auth_password.clone(),
+            security_level: cluster_config.security_level.clone(),
+            priv_protocol: cluster_config.priv_protocol.clone(),
+            priv_password: cluster_config.priv_password.clone(),
+        };
+
+        // 复用 build_args 做前置校验，避免同样的版本分支写两遍
+        transport.build_args()?;
+
+        Ok(transport)
+    }
+
+    /// 按版本拼接底层命令的参数，v1/v2c 与 v3 走完全不同的两套
+    fn build_args(&self) -> Result<Vec<String>, String> {
+        let mut args = vec![match self.version {
+            SnmpVersion::V1 => "-v1".to_string(),
+            SnmpVersion::V2c => "-v2c".to_string(),
+            SnmpVersion::V3 => "-v3".to_string(),
+        }];
+
+        if self.version != SnmpVersion::V3 {
+            args.extend([
+                "-c".into(),
+                self.required(self.community.as_deref(), "community")?,
+            ]);
+            return Ok(args);
+        }
+
+        let user = self.required(self.user.as_deref(), "user")?;
+        let security_level = self.required(self.security_level.as_deref(), "security_level")?;
+
+        args.extend(["-l".into(), security_level.clone(), "-u".into(), user]);
+
+        match security_level.as_str() {
+            "noAuthNoPriv" => {}
+            "authNoPriv" => {
+                args.extend([
+                    "-a".into(),
+                    self.required(self.auth_protocol.as_deref(), "auth_protocol")?,
+                    "-A".into(),
+                    self.required(self.auth_password.as_deref(), "auth_password")?,
+                ]);
+            }
+            "authPriv" => {
+                args.extend([
+                    "-a".into(),
+                    self.required(self.auth_protocol.as_deref(), "auth_protocol")?,
+                    "-A".into(),
+                    self.required(self.auth_password.as_deref(), "auth_password")?,
+                    "-x".into(),
+                    self.required(self.priv_protocol.as_deref(), "priv_protocol")?,
+                    "-X".into(),
+                    self.required(self.priv_password.as_deref(), "priv_password")?,
+                ]);
+            }
+            other => return Err(format!("invalid security_level: {}", other)),
+        }
+
+        Ok(args)
+    }
+
+    /// 取出必填参数，缺失或为空时报出字段名，方便定位配置问题
+    fn required(&self, value: Option<&str>, field: &str) -> Result<String, String> {
+        value
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("SNMP {:?} requires `{}` to be set", self.version, field))
+    }
+}
+
+/// 执行底层 snmp 命令；命令自身报错时只记录退出码与 stderr，仍然把 stdout 交给调用方解析，
+/// 保持与之前一致的「单个 OID 取不到不影响其余数据采集」行为
+async fn run_snmp(program: &str, args: &[String]) -> Result<String, String> {
+    let out = tokio::process::Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run {}: {}", program, e))?;
+
+    if !out.status.success() {
+        // 参数尾部固定是 target 与 oid，日志只输出这两个，避免把密码带上
+        let target = args
+            .get(args.len().saturating_sub(2))
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        warn!(
+            "{} query for {} failed with {}: {}",
+            program,
+            target,
+            out.status,
+            stderr.trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+async fn snmp_get(transport: &SnmpTransport, target: &str, oid: &str) -> Result<String, String> {
+    let mut args = transport.build_args()?;
     args.push(target.into());
     args.push(oid.into());
 
-    let out = tokio::process::Command::new("snmpget")
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    debug!(
+        "running snmpget version={:?} target={} oid={}",
+        transport.version, target, oid
+    );
 
-    parse_snmp_value(&String::from_utf8_lossy(&out.stdout))
+    let out = run_snmp("snmpget", &args).await?;
+
+    parse_snmp_value(&out)
 }
 
 async fn snmpwalk_kv(
+    transport: &SnmpTransport,
     target: &str,
-    user: &str,
-    auth_protocol: &str,
-    auth_password: &str,
-    security_level: &str,
-    priv_protocol: &Option<String>,
-    priv_password: &Option<String>,
     base_oid: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let mut args = build_snmpv3_args(
-        user,
-        auth_protocol,
-        auth_password,
-        security_level,
-        priv_protocol,
-        priv_password,
-    )?;
+    let mut args = transport.build_args()?;
     args.push(target.into());
     args.push(base_oid.into());
 
-    let out = tokio::process::Command::new("snmpwalk")
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+    debug!(
+        "running snmpwalk version={:?} target={} oid={}",
+        transport.version, target, base_oid
+    );
 
-    let s = String::from_utf8_lossy(&out.stdout);
+    let out = run_snmp("snmpwalk", &args).await?;
+
     let mut map = HashMap::new();
 
-    for line in s.lines() {
+    for line in out.lines() {
         if let Some((oid, val)) = line.split_once(" = ") {
             let idx = normalize_oid(oid)
                 .trim_start_matches(base_oid)
@@ -614,6 +621,8 @@ async fn snmpwalk_kv(
             map.insert(idx, value);
         }
     }
+
+    debug!("snmpwalk {} returned {} entries", base_oid, map.len());
 
     Ok(map)
 }
@@ -758,14 +767,119 @@ impl Default for SnmpSwitchLldpConfig {
             clusters: vec![SnmpClusterConfig {
                 name: "default".to_string(),
                 targets: vec!["127.0.0.1".to_string()],
-                user: "snmp_user".to_string(),
-                auth_protocol: "MD5".to_string(),
-                auth_password: "password".to_string(),
-                security_level: "authNoPriv".to_string(),
+                version: default_version(),
+                community: None,
+                user: Some("snmp_user".to_string()),
+                auth_protocol: Some("MD5".to_string()),
+                auth_password: Some("password".to_string()),
+                security_level: Some("authNoPriv".to_string()),
                 priv_protocol: None,
                 priv_password: None,
                 scrape_interval_secs: default_interval(),
             }],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_interval, SnmpClusterConfig, SnmpTransport, SnmpVersion};
+
+    /// 构造一个只指定版本的集群配置，其余认证参数由测试用例按需填充
+    fn cluster(version: SnmpVersion) -> SnmpClusterConfig {
+        SnmpClusterConfig {
+            name: "test".to_string(),
+            targets: vec!["127.0.0.1".to_string()],
+            version,
+            community: None,
+            user: None,
+            auth_protocol: None,
+            auth_password: None,
+            security_level: None,
+            priv_protocol: None,
+            priv_password: None,
+            scrape_interval_secs: default_interval(),
+        }
+    }
+
+    /// 构造一个完整的 v3 集群配置
+    fn v3_cluster(security_level: &str) -> SnmpClusterConfig {
+        let mut config = cluster(SnmpVersion::V3);
+        config.user = Some("snmp_user".to_string());
+        config.security_level = Some(security_level.to_string());
+        config.auth_protocol = Some("MD5".to_string());
+        config.auth_password = Some("snmppwv3".to_string());
+        config
+    }
+
+    #[test]
+    fn v2c_builds_community_command() {
+        let mut config = cluster(SnmpVersion::V2c);
+        config.community = Some("public".to_string());
+
+        let transport = SnmpTransport::from_cluster(&config).unwrap();
+        assert_eq!(
+            transport.build_args().unwrap(),
+            vec!["-v2c", "-c", "public"]
+        );
+    }
+
+    #[test]
+    fn v1_builds_community_command() {
+        let mut config = cluster(SnmpVersion::V1);
+        config.community = Some("public".to_string());
+
+        let transport = SnmpTransport::from_cluster(&config).unwrap();
+        assert_eq!(transport.build_args().unwrap(), vec!["-v1", "-c", "public"]);
+    }
+
+    #[test]
+    fn v3_builds_usm_command() {
+        let config = v3_cluster("authNoPriv");
+
+        let transport = SnmpTransport::from_cluster(&config).unwrap();
+        assert_eq!(
+            transport.build_args().unwrap(),
+            vec![
+                "-v3",
+                "-l",
+                "authNoPriv",
+                "-u",
+                "snmp_user",
+                "-a",
+                "MD5",
+                "-A",
+                "snmppwv3"
+            ]
+        );
+    }
+
+    #[test]
+    fn v2c_requires_community() {
+        let config = cluster(SnmpVersion::V2c);
+
+        assert!(SnmpTransport::from_cluster(&config).is_err());
+    }
+
+    #[test]
+    fn v3_requires_user_and_security_level() {
+        let config = cluster(SnmpVersion::V3);
+
+        assert!(SnmpTransport::from_cluster(&config).is_err());
+    }
+
+    #[test]
+    fn auth_priv_requires_priv_params() {
+        let config = v3_cluster("authPriv");
+
+        assert!(SnmpTransport::from_cluster(&config).is_err());
+    }
+
+    #[test]
+    fn unknown_security_level_is_rejected() {
+        let config = v3_cluster("noSuchLevel");
+
+        let error = SnmpTransport::from_cluster(&config).err().unwrap();
+        assert!(error.contains("invalid security_level"), "got: {}", error);
     }
 }
