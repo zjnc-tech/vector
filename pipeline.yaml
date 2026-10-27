@@ -1,0 +1,19 @@
+# The host submits events to runtime.emit("musa_malloc", ...).
+sources:
+  musa_malloc:
+    type: external
+
+transforms:
+  add_field:
+    type: remap
+    inputs: [musa_malloc]
+    source: |
+      .event_type = "musa_malloc"
+
+sinks:
+  console:
+    type: console
+    inputs: [add_field]
+    target: stdout
+    encoding:
+      codec: json

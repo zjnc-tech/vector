@@ -1,0 +1,21 @@
+[package]
+name = "vector-runtime-c"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "vector_runtime_c"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["console", "clickhouse", "kafka", "vector", "prometheus"]
+console = ["vector-runtime/console"]
+clickhouse = ["vector-runtime/clickhouse"]
+kafka = ["vector-runtime/kafka"]
+vector = ["vector-runtime/vector"]
+prometheus = ["vector-runtime/prometheus"]
+
+[dependencies]
+vector-runtime = { path = "../vector-runtime", default-features = false, features = ["owned-runtime"] }

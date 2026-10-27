@@ -1,0 +1,34 @@
+[package]
+name = "vector-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+name = "vector_runtime"
+
+[features]
+default = ["console", "clickhouse", "kafka", "vector", "prometheus"]
+owned-runtime = ["tokio/rt-multi-thread", "tokio/net", "tokio/time"]
+console = ["vector/sinks-console"]
+clickhouse = ["vector/sinks-clickhouse"]
+kafka = ["vector/sinks-kafka"]
+vector = ["vector/sinks-vector"]
+prometheus = ["vector/sinks-prometheus"]
+
+[dependencies]
+vector = { path = "../..", default-features = false, features = ["sources-external", "transforms-remap", "transforms-filter", "transforms-route", "transforms-aggregate", "transforms-reduce", "transforms-log_to_metric"] }
+vector-external-macros.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = { version = "0.9.34", default-features = false }
+thiserror.workspace = true
+
+[dev-dependencies]
+hyper = { version = "0.14.28", default-features = false, features = ["server", "tcp", "http1"] }
+
+[[example]]
+name = "console"
+required-features = ["console", "owned-runtime"]

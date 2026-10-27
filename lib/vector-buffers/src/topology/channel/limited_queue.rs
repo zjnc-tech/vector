@@ -80,6 +80,17 @@ pub struct LimitedSender<T> {
 }
 
 impl<T: InMemoryBufferable> LimitedSender<T> {
+    /// Closes admission and lets the receiver drain already queued items, even
+    /// while sender clones remain alive.
+    ///
+    /// The caller must first prevent new sends and wait for all in-flight send
+    /// futures and try_send calls to finish or be dropped. Otherwise a sender
+    /// that already acquired permits could enqueue after the receiver exits.
+    pub fn close_when_idle(&self) {
+        self.inner.limiter.close();
+        self.inner.read_waker.notify_one();
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn get_required_permits_for_item(&self, item: &T) -> u32 {
         // We have to limit the number of permits we ask for to the overall limit since we're always

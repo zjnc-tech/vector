@@ -93,6 +93,16 @@ impl RunningTopology {
         self.shutdown_coordinator.shutdown_tripwire()
     }
 
+    /// Obtain cancellation handles for an embedding application's shutdown deadline.
+    /// Aborting these tasks can discard undelivered events; prefer `stop` first.
+    pub fn abort_handles(&self) -> Vec<tokio::task::AbortHandle> {
+        self.tasks
+            .values()
+            .chain(self.source_tasks.values())
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect()
+    }
+
     /// Shut down all topology components.
     ///
     /// This function sends the shutdown signal to all sources in this topology

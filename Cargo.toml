@@ -121,6 +121,10 @@ members = [
   "lib/vector-config",
   "lib/vector-config-common",
   "lib/vector-config-macros",
+  "lib/vector-external-macros",
+  "lib/vector-runtime",
+  "lib/vector-runtime-c",
+  "lib/vector-runtime-python",
   "lib/vector-core",
   "lib/vector-lib",
   "lib/vector-lookup",
@@ -177,7 +181,9 @@ vector-lib = { path = "lib/vector-lib", default-features = false, features = ["v
 vector-config = { path = "lib/vector-config" }
 vector-config-common = { path = "lib/vector-config-common" }
 vector-config-macros = { path = "lib/vector-config-macros" }
-vrl = { git = "https://github.com/vectordotdev/vrl", branch = "main", features = ["arbitrary", "cli", "test", "test_framework"] }
+vector-external-macros = { path = "lib/vector-external-macros" }
+# Pin the compatible VRL API for downstream Git/path consumers, which do not use this workspace lockfile.
+vrl = { git = "https://github.com/vectordotdev/vrl", rev = "d802b308d7b9d96f8dc5cd2d8e2f726bb9ca345d", features = ["arbitrary", "cli", "test", "test_framework"] }
 
 [dependencies]
 cfg-if.workspace = true
@@ -276,7 +282,8 @@ tower = { version = "0.4.13", default-features = false, features = ["buffer", "l
 tower-http = { version = "0.4.4", default-features = false, features = ["compression-full", "decompression-gzip", "trace"] }
 # Serde
 serde.workspace = true
-serde-toml-merge = { version = "0.3.8", default-features = false }
+# 0.3.11 exposes toml 0.9 types; keep this API aligned with our toml 0.8 dependency.
+serde-toml-merge = { version = "=0.3.8", default-features = false }
 serde_bytes = { version = "0.11.17", default-features = false, features = ["std"], optional = true }
 serde_json.workspace = true
 serde_with = { version = "3.12.0", default-features = false, features = ["macros", "std"] }
@@ -380,7 +387,7 @@ pulsar = { version = "6.3.0", default-features = false, features = ["tokio-runti
 quick-junit = { version = "0.5.1" }
 rand.workspace = true
 rand_distr.workspace = true
-rdkafka = { version = "0.37.0", default-features = false, features = ["curl-static", "tokio", "libz", "ssl", "zstd"], optional = true }
+rdkafka = { version = "0.37.0", default-features = false, features = ["cmake_build", "curl-static", "tokio", "libz", "ssl", "zstd"], optional = true }
 redis = { version = "0.24.0", default-features = false, features = ["connection-manager", "tokio-comp", "tokio-native-tls-comp"], optional = true }
 regex = { version = "1.11.1", default-features = false, features = ["std", "perf"] }
 roaring = { version = "0.10.10", default-features = false, features = ["std"], optional = true }
@@ -638,6 +645,7 @@ sources-dnstap = ["sources-utils-net-tcp", "dep:base64", "dep:hickory-proto", "d
 sources-docker_logs = ["docker"]
 sources-eventstoredb_metrics = []
 sources-exec = []
+sources-external = []
 sources-file = ["vector-lib/file-source"]
 sources-file_descriptor = ["tokio-util/io"]
 sources-fluent = ["dep:base64", "sources-utils-net-tcp", "tokio-util/net", "dep:rmpv", "dep:rmp-serde", "dep:serde_bytes"]

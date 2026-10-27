@@ -26,6 +26,7 @@ use crate::config::OutputId;
 
 pub mod array;
 pub mod discriminant;
+pub mod external;
 mod estimated_json_encoded_size_of;
 mod log_event;
 #[cfg(feature = "lua")]

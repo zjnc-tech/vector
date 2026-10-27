@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "vector-runtime"
+version = "0.1.0"
+description = "Embedded Vector pipelines with native structured event ingestion"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MPL-2.0" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+python-source = "python"
+module-name = "vector_runtime._native"
+exclude = ["**/__pycache__/**", "**/*.pyc"]

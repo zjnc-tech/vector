@@ -192,19 +192,20 @@ fn main() {
     // Always rerun if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
 
-    println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
-    println!("cargo:rustc-link-lib=dylib=lldpctl");
-
-    println!("cargo:rerun-if-changed=src/sources/lldp/wrapper.h");
-
-    generate_lldp_bindings();
-
-    println!("cargo:rustc-link-lib=dylib=dcgm");
-
-    println!("cargo:rerun-if-changed=src/sources/dcgm/wrapper.h");
-
-    generate_dcgm_bindings();
-    generate_dcgm_field_maps();
+    if cfg!(any(feature = "sources-lldp", feature = "sources-dcgm")) {
+        println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+    }
+    if cfg!(feature = "sources-lldp") {
+        println!("cargo:rustc-link-lib=dylib=lldpctl");
+        println!("cargo:rerun-if-changed=src/sources/lldp/wrapper.h");
+        generate_lldp_bindings();
+    }
+    if cfg!(feature = "sources-dcgm") {
+        println!("cargo:rustc-link-lib=dylib=dcgm");
+        println!("cargo:rerun-if-changed=src/sources/dcgm/wrapper.h");
+        generate_dcgm_bindings();
+        generate_dcgm_field_maps();
+    }
 
     // re-run if the HEAD has changed. This is only necessary for non-release and nightly builds.
     #[cfg(not(feature = "nightly"))]

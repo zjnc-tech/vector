@@ -27,6 +27,10 @@ pub mod docker_logs;
 pub mod eventstoredb_metrics;
 #[cfg(feature = "sources-exec")]
 pub mod exec;
+
+#[cfg(feature = "sources-external")]
+pub mod external;
+
 #[cfg(feature = "sources-file")]
 pub mod file;
 #[cfg(any(

@@ -202,8 +202,20 @@ impl BatchNotifier {
         let notifier = OwnedBatchNotifier {
             status: AtomicCell::new(BatchStatus::Delivered),
             notifier: Some(sender),
+            on_complete: None,
         };
         (Self(Arc::new(notifier)), BatchStatusReceiver(receiver))
+    }
+
+    /// Creates a notifier that invokes a callback when all event finalizers finish.
+    /// The callback runs on the thread releasing the last reference and must not
+    /// block or panic. This avoids spawning a task for each embedded submission.
+    pub fn new_with_callback(callback: impl FnOnce(BatchStatus) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(OwnedBatchNotifier {
+            status: AtomicCell::new(BatchStatus::Delivered),
+            notifier: None,
+            on_complete: Some(CompletionCallback(Box::new(callback))),
+        }))
     }
 
     /// Optionally creates a new `BatchNotifier` along with the receiver used to await its finalization status.
@@ -257,11 +269,23 @@ impl BatchNotifier {
 pub struct OwnedBatchNotifier {
     status: AtomicCell<BatchStatus>,
     notifier: Option<oneshot::Sender<BatchStatus>>,
+    on_complete: Option<CompletionCallback>,
+}
+
+struct CompletionCallback(Box<dyn FnOnce(BatchStatus) + Send + Sync>);
+
+impl std::fmt::Debug for CompletionCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CompletionCallback")
+    }
 }
 
 impl OwnedBatchNotifier {
     /// Sends the status of the notifier back to the source.
     fn send_status(&mut self) {
+        if let Some(callback) = self.on_complete.take() {
+            (callback.0)(self.status.load());
+        }
         if let Some(notifier) = self.notifier.take() {
             let status = self.status.load();
             // Ignore the error case, as it will happen during normal

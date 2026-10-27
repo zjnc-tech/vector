@@ -165,6 +165,26 @@ pub struct SourceSender {
 }
 
 impl SourceSender {
+    /// Close all output queues after the caller has stopped and joined sends.
+    #[cfg(feature = "sources-external")]
+    pub(crate) fn close_when_idle(&self) {
+        for inner in self.inner.iter().chain(self.named_inners.values()) {
+            inner.inner.close_when_idle();
+        }
+    }
+
+    /// Nonblocking submission of an already assembled batch to the default output.
+    #[cfg(feature = "sources-external")]
+    pub(crate) fn try_send_array(
+        &mut self,
+        events: EventArray,
+    ) -> Result<(), channel::LimitedTrySendError<EventArray>> {
+        self.inner
+            .as_mut()
+            .expect("no default output")
+            .try_send_array(events)
+    }
+
     pub fn builder() -> Builder {
         Builder {
             buf_size: CHUNK_SIZE,
@@ -414,7 +434,7 @@ impl Inner {
         )
     }
 
-    async fn send(&mut self, mut events: EventArray) -> Result<(), ClosedError> {
+    fn prepare(&self, mut events: EventArray) -> (SourceSenderItem, CountByteSize) {
         let send_reference = Instant::now();
         let reference = Utc::now().timestamp_millis();
         events
@@ -433,14 +453,43 @@ impl Inner {
 
         let byte_size = events.estimated_json_encoded_size_of();
         let count = events.len();
-        self.inner
-            .send(SourceSenderItem {
+        (
+            SourceSenderItem {
                 events,
                 send_reference,
-            })
-            .await
-            .map_err(|_| ClosedError)?;
-        self.events_sent.emit(CountByteSize(count, byte_size));
+            },
+            CountByteSize(count, byte_size),
+        )
+    }
+
+    async fn send(&mut self, events: EventArray) -> Result<(), ClosedError> {
+        let (item, count_byte_size) = self.prepare(events);
+        self.inner.send(item).await.map_err(|_| ClosedError)?;
+        self.events_sent.emit(count_byte_size);
+        Ok(())
+    }
+
+    #[cfg(feature = "sources-external")]
+    fn try_send_array(
+        &mut self,
+        events: EventArray,
+    ) -> Result<(), channel::LimitedTrySendError<EventArray>> {
+        use channel::LimitedTrySendError;
+
+        // Zero-event messages would acquire no permits in the limited queue.
+        if events.is_empty() {
+            return Ok(());
+        }
+        let (item, count_byte_size) = self.prepare(events);
+        self.inner.try_send(item).map_err(|error| match error {
+            LimitedTrySendError::InsufficientCapacity(item) => {
+                LimitedTrySendError::InsufficientCapacity(item.events)
+            }
+            LimitedTrySendError::Disconnected(item) => {
+                LimitedTrySendError::Disconnected(item.events)
+            }
+        })?;
+        self.events_sent.emit(count_byte_size);
         Ok(())
     }
 
